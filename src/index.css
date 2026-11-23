@@ -1,0 +1,32 @@
+@import "tailwindcss";
+
+@media print {
+  @page {
+    size: A4 portrait;
+    margin: 8mm;
+  }
+  
+  body {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+    background: white !important;
+  }
+
+  /* Grid 3 kolom x 3 baris pas di kertas A4 (9 kartu per lembar) */
+  .id-cards-a4-grid {
+    display: grid !important;
+    grid-template-columns: repeat(3, 54mm) !important;
+    gap: 6mm 6mm !important;
+    justify-content: center !important;
+    margin: 0 auto !important;
+  }
+
+  .id-card-print-box {
+    width: 54mm !important;
+    height: 86mm !important;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+    -webkit-column-break-inside: avoid !important;
+  }
+}
+

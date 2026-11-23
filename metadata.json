@@ -1,0 +1,6 @@
+{
+  "name": "Presensi Guru & Staf SMP Nurul Abror",
+  "description": "Aplikasi pencatatan presensi kehadiran guru dan staf SMP Nurul Abror Al-Robbaniyin dengan scan barcode/QR code, geofencing radius GPS sekolah, dan Google Sheets.",
+  "requestFramePermissions": ["camera", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
