@@ -221,8 +221,12 @@ export const QrGeneratorPrintView: React.FC<QrGeneratorPrintViewProps> = ({
           <div className="w-full max-w-2xl bg-white border border-slate-300 shadow-md rounded-2xl p-6 sm:p-10 text-center relative overflow-hidden print:border-none print:shadow-none print:p-4">
             {/* Top decorative header */}
             <div className="border-b-2 border-[#183153] pb-6 mb-6">
-              <div className="inline-flex items-center justify-center w-16 h-16 bg-blue-50 border border-blue-200 rounded-2xl mb-3 shadow-2xs">
-                <School className="w-9 h-9 text-[#183153]" />
+              <div className="inline-flex items-center justify-center w-20 h-20 bg-white border border-slate-200 rounded-full mb-3 p-1 shadow-sm overflow-hidden">
+                <img
+                  src="./assets/aistudio/LOGO_SMP_ca9ab34f.png"
+                  alt="Logo SMP Nurul Abror Al-Robbaniyin"
+                  className="w-full h-full object-contain rounded-full"
+                />
               </div>
               <h2 className="text-xl sm:text-2xl font-black text-slate-900 uppercase tracking-tight">
                 SMP Nurul Abror Al-Robbaniyin

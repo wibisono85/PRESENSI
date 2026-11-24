@@ -570,6 +570,18 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
 
       {/* 2. Kartu Profil Guru (Sederhana 1 Sentuhan) */}
       <div className="bg-white rounded-3xl p-5 border border-slate-200 shadow-sm space-y-3.5">
+        {!settings.webAppUrl && (
+          <div className="p-3 bg-amber-50 border border-amber-300 rounded-2xl flex items-start gap-2.5 text-xs text-amber-900">
+            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+            <div className="leading-relaxed">
+              <p className="font-extrabold">Belum Terhubung ke Database Google Sheets</p>
+              <p className="text-[11px] text-amber-800 mt-0.5">
+                Daftar nama di bawah masih memakai <strong>data bawaan aplikasi</strong> karena URL Apps Script belum terpasang. Klik <strong>Login PIN Server</strong> di pojok kanan atas untuk menempel URL Web App, atau isi variabel <code className="font-mono font-bold bg-amber-100 px-1 rounded">VITE_WEB_APP_URL</code> di GitHub Actions Variables.
+              </p>
+            </div>
+          </div>
+        )}
+
         <div className="flex items-center justify-between">
           <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">Identitas Guru / Staf:</span>
           {teacher && (

@@ -261,6 +261,10 @@ export default function App() {
           }
         }}
         webAppUrl={settings.webAppUrl}
+        onSaveWebAppUrl={(url) => {
+          saveStoredSettings({ webAppUrl: url });
+          setSettings((prev) => ({ ...prev, webAppUrl: url }));
+        }}
       />
 
       {/* Main Container */}

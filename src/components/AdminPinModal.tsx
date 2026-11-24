@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Lock, KeyRound, ShieldCheck, X, AlertCircle, Loader2 } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Lock, KeyRound, ShieldCheck, X, AlertCircle, Loader2, Link as LinkIcon } from 'lucide-react';
 import { verifyPinRemote } from '../utils/googleAppsScript';
 
 interface AdminPinModalProps {
@@ -7,17 +7,29 @@ interface AdminPinModalProps {
   onClose: () => void;
   onSuccess: (role: 'admin' | 'kurikulum') => void;
   webAppUrl: string;
+  onSaveWebAppUrl?: (url: string) => void;
 }
 
 export const AdminPinModal: React.FC<AdminPinModalProps> = ({
   isOpen,
   onClose,
   onSuccess,
-  webAppUrl
+  webAppUrl,
+  onSaveWebAppUrl
 }) => {
   const [pinInput, setPinInput] = useState<string>('');
+  const [urlInput, setUrlInput] = useState<string>(webAppUrl || '');
+  const [showUrlField, setShowUrlField] = useState<boolean>(!webAppUrl);
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [isLoading, setIsLoading] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (isOpen) {
+      setUrlInput(webAppUrl || '');
+      setShowUrlField(!webAppUrl);
+      setErrorMsg('');
+    }
+  }, [isOpen, webAppUrl]);
 
   if (!isOpen) return null;
 
@@ -25,20 +37,33 @@ export const AdminPinModal: React.FC<AdminPinModalProps> = ({
     e.preventDefault();
     setErrorMsg('');
 
-    const trimmed = pinInput.trim();
-    if (!trimmed) {
-      setErrorMsg('Silakan masukkan PIN terlebih dahulu.');
+    const trimmedPin = pinInput.trim();
+    const targetUrl = (showUrlField ? urlInput : webAppUrl).trim();
+
+    if (!targetUrl) {
+      setErrorMsg('Tempel URL Google Apps Script Web App (https://script.google.com/macros/s/.../exec) terlebih dahulu.');
+      setShowUrlField(true);
       return;
     }
 
-    if (!webAppUrl) {
-      setErrorMsg('URL Google Apps Script belum diatur di Pengaturan. Pastikan Web App terhubung untuk validasi PIN server.');
+    if (!targetUrl.startsWith('https://script.google.com/')) {
+      setErrorMsg('URL Web App harus diawali https://script.google.com/... (salin dari menu Deploy > Web App di Google Sheets).');
+      setShowUrlField(true);
+      return;
+    }
+
+    if (!trimmedPin) {
+      setErrorMsg('Silakan masukkan PIN terlebih dahulu.');
       return;
     }
 
     setIsLoading(true);
     try {
-      const res = await verifyPinRemote(webAppUrl, trimmed);
+      if (targetUrl !== webAppUrl && onSaveWebAppUrl) {
+        onSaveWebAppUrl(targetUrl);
+      }
+
+      const res = await verifyPinRemote(targetUrl, trimmedPin);
       if (res.success && res.role) {
         setPinInput('');
         onSuccess(res.role);
@@ -54,7 +79,7 @@ export const AdminPinModal: React.FC<AdminPinModalProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4 animate-in fade-in duration-150">
-      <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-md p-6 space-y-5 relative">
+      <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-md p-6 space-y-5 relative max-h-[92vh] overflow-y-auto">
         <button
           onClick={onClose}
           disabled={isLoading}
@@ -77,7 +102,41 @@ export const AdminPinModal: React.FC<AdminPinModalProps> = ({
           </div>
         </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4 pt-2">
+        <form onSubmit={handleSubmit} className="space-y-4 pt-1">
+          {showUrlField ? (
+            <div className="p-3 bg-blue-50/80 border border-blue-200 rounded-xl space-y-2">
+              <label htmlFor="input-modal-webapp-url" className="block text-xs font-bold text-blue-950 flex items-center gap-1.5">
+                <LinkIcon className="w-3.5 h-3.5 text-[#2F5597]" />
+                <span>URL Google Apps Script Web App</span>
+              </label>
+              <input
+                type="url"
+                id="input-modal-webapp-url"
+                disabled={isLoading}
+                placeholder="https://script.google.com/macros/s/AKfycb.../exec"
+                value={urlInput}
+                onChange={(e) => setUrlInput(e.target.value)}
+                className="w-full px-3 py-2 bg-white border border-blue-300 rounded-lg text-xs font-mono text-slate-800 focus:ring-2 focus:ring-[#2F5597] focus:outline-none disabled:opacity-50"
+              />
+              <p className="text-[10.5px] text-blue-900 leading-relaxed">
+                Pada GitHub Pages baru, URL server belum terbaca jika <code className="font-mono font-bold bg-blue-100 px-1 rounded">VITE_WEB_APP_URL</code> belum diisi di <strong>GitHub Settings &rarr; Secrets and variables &rarr; Actions &rarr; Variables</strong>. Tempel URL Web App di sini agar langsung tersinkron.
+              </p>
+            </div>
+          ) : (
+            <div className="flex items-center justify-between px-3 py-2 bg-emerald-50 border border-emerald-200 rounded-xl text-[11px]">
+              <span className="text-emerald-800 font-semibold truncate mr-2">
+                Server terhubung ke Apps Script
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowUrlField(true)}
+                className="text-emerald-900 font-bold underline shrink-0 hover:text-emerald-700"
+              >
+                Ubah URL
+              </button>
+            </div>
+          )}
+
           <div>
             <label htmlFor="input-admin-pin" className="block text-xs font-bold text-slate-700 mb-1 flex items-center gap-1.5">
               <KeyRound className="w-3.5 h-3.5 text-[#2F5597]" />
@@ -86,7 +145,7 @@ export const AdminPinModal: React.FC<AdminPinModalProps> = ({
             <input
               type="password"
               id="input-admin-pin"
-              autoFocus
+              autoFocus={!showUrlField}
               maxLength={12}
               disabled={isLoading}
               placeholder="Masukkan PIN Anda"

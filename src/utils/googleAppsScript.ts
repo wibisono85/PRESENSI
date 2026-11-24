@@ -1649,6 +1649,21 @@ export function getStoredSettings(): AppSettings {
   if (typeof window !== 'undefined') {
     // Pastikan tidak ada PIN tersimpan di localStorage browser sesuai kepatuhan keamanan
     localStorage.removeItem('smp_nurul_abror_admin_pin');
+
+    // Jika dibuka melalui tautan cepat (?webAppUrl=https://script.google.com/...), simpan otomatis ke perangkat
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const urlParam = (params.get('webAppUrl') || params.get('webapp') || '').trim();
+      if (urlParam && urlParam.startsWith('https://script.google.com/')) {
+        localStorage.setItem(STORAGE_KEY_WEB_APP, urlParam);
+      }
+      const sheetParam = (params.get('sheetUrl') || '').trim();
+      if (sheetParam && sheetParam.startsWith('https://docs.google.com/spreadsheets/')) {
+        localStorage.setItem(STORAGE_KEY_SHEET_URL, sheetParam);
+      }
+    } catch (e) {
+      // ignore invalid URL params
+    }
   }
 
   const webAppUrl = localStorage.getItem(STORAGE_KEY_WEB_APP) || DEFAULT_WEB_APP_URL;
@@ -1766,7 +1781,7 @@ export function getLocalMasterData(): MasterGuruStaf[] {
 
   try {
     const parsed = JSON.parse(stored);
-    if (Array.isArray(parsed) && parsed.length >= 30) {
+    if (Array.isArray(parsed) && parsed.length > 0) {
       const normalized = normalizeMasterGuruStaf(parsed);
       saveLocalMasterData(normalized);
       return normalized;

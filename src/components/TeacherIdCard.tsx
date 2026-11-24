@@ -7,10 +7,9 @@ import { buildMapelString } from '../utils/jadwalEngine';
 import { 
   Download, 
   RotateCw, 
-  Camera, 
-  ShieldCheck, 
-  School, 
-  Award, 
+  Camera,
+  ShieldCheck,
+  Award,
   CheckCircle2, 
   Sparkles,
   Scissors
@@ -112,8 +111,12 @@ export const TeacherIdCard: React.FC<TeacherIdCardProps> = ({
 
             {/* Top School Header */}
             <div className="bg-gradient-to-b from-[#152a4a] to-[#1e3d6b] text-white px-2 pb-1.5 text-center relative border-b-2 border-amber-400">
-              <div className="flex items-center justify-center gap-1 pt-0.5">
-                <School className="w-3.5 h-3.5 text-amber-300 shrink-0" />
+              <div className="flex items-center justify-center gap-1.5 pt-0.5">
+                <img
+                  src="./assets/aistudio/LOGO_SMP_ca9ab34f.png"
+                  alt="Logo Sekolah"
+                  className="w-4 h-4 rounded-full object-contain bg-white p-[1px] shrink-0"
+                />
                 <p className="text-[9px] font-black tracking-wide text-amber-300 uppercase leading-none">
                   SMP Nurul Abror
                 </p>

@@ -295,6 +295,33 @@ export const AppsScriptSetup: React.FC<AppsScriptSetupProps> = ({
             <p className="text-[11px] text-slate-500 mt-1">
               Dapatkan URL ini dari menu Deploy &gt; New Deployment &gt; Web App di Google Apps Script Anda.
             </p>
+            <div className="mt-2.5 p-3 bg-indigo-50/70 border border-indigo-200 rounded-xl text-[11px] text-indigo-950 space-y-1.5">
+              <p className="font-bold">
+                Agar GitHub Pages &amp; semua HP guru otomatis terhubung ke database sekolah:
+              </p>
+              <p className="leading-relaxed">
+                Tambahkan <strong>Repository Variables</strong> di GitHub (<strong>Settings &rarr; Secrets and variables &rarr; Actions &rarr; tab Variables</strong>) dengan nama <code className="font-mono font-bold bg-indigo-100 px-1 rounded">VITE_WEB_APP_URL</code> (isi dengan URL Web App di atas) dan opsional <code className="font-mono font-bold bg-indigo-100 px-1 rounded">VITE_SHEET_URL</code>, lalu jalankan ulang GitHub Action.
+              </p>
+              {webAppUrl.trim() && typeof window !== 'undefined' && (
+                <div className="pt-1 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const shareUrl = `${window.location.origin}${window.location.pathname}?webAppUrl=${encodeURIComponent(webAppUrl.trim())}`;
+                      navigator.clipboard.writeText(shareUrl);
+                      setTestResult({
+                        success: true,
+                        message: 'Tautan cepat HP guru (?webAppUrl=...) berhasil disalin! Bagikan link ini agar perangkat guru otomatis sinkron.'
+                      });
+                    }}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-indigo-700 hover:bg-indigo-800 text-white rounded-lg font-bold text-[11px] transition"
+                  >
+                    <Copy className="w-3 h-3" />
+                    <span>Salin Link Aplikasi Siap Pakai (untuk HP Guru)</span>
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">

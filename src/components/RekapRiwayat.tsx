@@ -1605,13 +1605,22 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
         `}</style>
 
         {/* Kop Surat Resmi Sekolah */}
-        <div className="text-center border-b-4 border-double border-slate-900 pb-3 mb-5 print-avoid-break">
-          <div className="text-[11px] font-bold tracking-widest text-slate-600 uppercase">YAYASAN AL-ROBBANIYIN BANYUWANGI</div>
-          <h1 className="text-xl font-black uppercase tracking-wide text-slate-900 mt-0.5">SMP NURUL ABROR AL-ROBBANIYIN</h1>
-          <p className="text-[10px] text-slate-600 mt-0.5">
-            Jl. Raya Alasbuluh No. 01 Wongsorejo, Kabupaten Banyuwangi, Jawa Timur 68453
-          </p>
-          <div className="mt-3 pt-2 border-t border-slate-300">
+        <div className="border-b-4 border-double border-slate-900 pb-3 mb-5 print-avoid-break">
+          <div className="flex items-center justify-center gap-4">
+            <img
+              src="./assets/aistudio/LOGO_SMP_ca9ab34f.png"
+              alt="Logo SMP Nurul Abror Al-Robbaniyin"
+              className="w-16 h-16 object-contain shrink-0"
+            />
+            <div className="text-center">
+              <div className="text-[11px] font-bold tracking-widest text-slate-600 uppercase">YAYASAN AL-ROBBANIYIN BANYUWANGI</div>
+              <h1 className="text-xl font-black uppercase tracking-wide text-slate-900 mt-0.5">SMP NURUL ABROR AL-ROBBANIYIN</h1>
+              <p className="text-[10px] text-slate-600 mt-0.5">
+                Jl. Raya Alasbuluh No. 01 Wongsorejo, Kabupaten Banyuwangi, Jawa Timur 68453
+              </p>
+            </div>
+          </div>
+          <div className="mt-3 pt-2 border-t border-slate-300 text-center">
             <h2 className="text-sm font-black uppercase tracking-wider text-slate-900">
               LAPORAN REKAPITULASI RESMI PRESENSI GURU &amp; STAF
             </h2>

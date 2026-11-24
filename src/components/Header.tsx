@@ -4,7 +4,6 @@ import {
   ClipboardList,
   UserX,
   Settings,
-  School,
   CheckCircle,
   AlertTriangle,
   Users,
@@ -82,8 +81,12 @@ export const Header: React.FC<HeaderProps> = ({
       {/* Top Banner */}
       <div className="max-w-7xl mx-auto px-4 py-3 sm:px-6 flex flex-col sm:flex-row items-center justify-between gap-2">
         <div className="flex items-center gap-3">
-          <div className="w-11 h-11 bg-white/10 rounded-xl flex items-center justify-center border border-white/20 shrink-0">
-            <School className="w-6 h-6 text-yellow-300" />
+          <div className="w-11 h-11 bg-white rounded-full flex items-center justify-center border border-yellow-300/70 shadow-sm p-0.5 shrink-0 overflow-hidden">
+            <img
+              src="./assets/aistudio/LOGO_SMP_ca9ab34f.png"
+              alt="Logo SMP Nurul Abror Al-Robbaniyin"
+              className="w-full h-full object-contain rounded-full"
+            />
           </div>
           <div>
             <h1 className="text-lg sm:text-xl font-bold tracking-tight text-white leading-tight">

@@ -1909,12 +1909,21 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ logs, masterList, 
 
       {/* Printable Formal Layout for Principal (Hidden during normal view, visible when printing) */}
       <div className="hidden print:block p-8 bg-white text-black font-sans">
-        <div className="text-center border-b-2 border-slate-900 pb-4 mb-6">
-          <h1 className="text-2xl font-bold uppercase tracking-wide">SMP NURUL ABROR AL-ROBBANIYIN</h1>
-          <h2 className="text-lg font-semibold mt-1">LAPORAN REKAPITULASI PRESENSI &amp; EVALUASI KEHADIRAN GURU &amp; STAF</h2>
-          <p className="text-sm mt-1">
-            Periode Laporan: <strong>{formatLongDateIndonesian(startDate)}</strong> &mdash; <strong>{formatLongDateIndonesian(endDate)}</strong>
-          </p>
+        <div className="border-b-2 border-slate-900 pb-4 mb-6">
+          <div className="flex items-center justify-center gap-4">
+            <img
+              src="./assets/aistudio/LOGO_SMP_ca9ab34f.png"
+              alt="Logo SMP Nurul Abror Al-Robbaniyin"
+              className="w-14 h-14 object-contain shrink-0"
+            />
+            <div className="text-center">
+              <h1 className="text-2xl font-bold uppercase tracking-wide">SMP NURUL ABROR AL-ROBBANIYIN</h1>
+              <h2 className="text-lg font-semibold mt-1">LAPORAN REKAPITULASI PRESENSI &amp; EVALUASI KEHADIRAN GURU &amp; STAF</h2>
+              <p className="text-sm mt-1">
+                Periode Laporan: <strong>{formatLongDateIndonesian(startDate)}</strong> &mdash; <strong>{formatLongDateIndonesian(endDate)}</strong>
+              </p>
+            </div>
+          </div>
         </div>
 
         {/* Summary Stats Grid */}
