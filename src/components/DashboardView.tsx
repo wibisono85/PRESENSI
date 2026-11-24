@@ -73,6 +73,7 @@ const STATUS_COLORS: Record<StatusPresensi, string> = {
   'Alpa': '#EF4444',        // Red-500
   'Alpa (Jadwal Mengajar)': '#DC2626', // Red-600
   'Alpa (Wajib Hadir Staf)': '#B91C1C', // Red-700
+  'Alpa (Wajib Hadir Guru BK)': '#991B1B', // Red-800
   'Dinas Luar': '#8B5CF6'   // Purple-500
 };
 
@@ -178,7 +179,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ logs, masterList, 
       const m = timeToMinutes(log.batasMengajar);
       if (m !== null) return m;
     }
-    if (log.batasStaf && log.peran === 'Staf') {
+    if (log.batasStaf && (log.peran === 'Staf' || log.peran === 'Guru BK')) {
       const m = timeToMinutes(log.batasStaf);
       if (m !== null) return m;
     }
@@ -193,7 +194,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ logs, masterList, 
         settings?.kebijakanKehadiran || 'instruksi_kepala_sekolah',
         jadwalList,
         settings?.guruToleransiMenit || 0,
-        settings?.guruTanpaJadwalWajibHadir || false
+        settings?.guruTanpaJadwalWajibHadir || false,
+        undefined,
+        settings?.attendanceRuleOverrides
       );
       const used = log.batasMengajar || log.batasStaf || evalRes.thresholdUsed;
       const m = timeToMinutes(used);
@@ -595,6 +598,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ logs, masterList, 
           'Alpa': 0,
           'Alpa (Jadwal Mengajar)': 0,
           'Alpa (Wajib Hadir Staf)': 0,
+          'Alpa (Wajib Hadir Guru BK)': 0,
           'Dinas Luar': 0
         });
       }

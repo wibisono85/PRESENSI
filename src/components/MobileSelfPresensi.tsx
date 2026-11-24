@@ -22,7 +22,7 @@ import {
 } from '../utils/qrAndGeoUtils';
 import { getHariFromDate, formatDateISO, formatTimeHHMM } from '../utils/dateUtils';
 import { evaluateStatus24h, parseAndFormat24hTime, timeToMinutes, minutesToTime } from '../utils/timeUtils';
-import { evaluateTeacherAttendanceStatus, evaluateTeacherScheduleForDay, determineTeacherPeran, isTeacherWajibHadir } from '../utils/scheduleTimeEvaluator';
+import { evaluateTeacherAttendanceStatus, evaluateTeacherScheduleForDay, determineTeacherPeran, isTeacherWajibHadir, resolveTeacherAttendanceRule } from '../utils/scheduleTimeEvaluator';
 import { getMasterDataSourceLabel, getRawMapelByDay, verifyPinRemote } from '../utils/googleAppsScript';
 import { buildMapelString, isJadwalTidakDitemukan } from '../utils/jadwalEngine';
 import { QrCameraScanner } from './QrCameraScanner';
@@ -159,14 +159,31 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
   const mapelHariIni = teacher ? buildMapelString(teacher, hariIni, jadwalList) : '-';
 
   // Active schedule evaluation & customized threshold for this teacher today
-  const scheduleEval = teacher
-    ? evaluateTeacherScheduleForDay(teacher, hariIni, settings.jamMasukThreshold || '07:25', jadwalList)
+  const ruleInfo = teacher
+    ? resolveTeacherAttendanceRule(teacher, jadwalList, undefined, settings.attendanceRuleOverrides)
     : null;
-  const activeThreshold = scheduleEval?.thresholdTime || settings.jamMasukThreshold || '07:25';
+  const scheduleEval = teacher
+    ? evaluateTeacherScheduleForDay(teacher, hariIni, settings.jamMasukThreshold || '07:25', jadwalList, settings.attendanceRuleOverrides)
+    : null;
+
+  const schoolThresholdDefault = settings.jamMasukThreshold || '07:25';
+  const hasTeachingTodayMain = Boolean(scheduleEval?.hasTeachingSchedule && scheduleEval.sesiList.length > 0);
+  const personalBatasGuru = scheduleEval?.firstScheduleTime
+    ? minutesToTime(Math.max(0, (timeToMinutes(scheduleEval.firstScheduleTime) ?? 450) - (settings.guruToleransiMenit || 0)))
+    : null;
+
+  const activeThreshold = (() => {
+    if (!teacher || !ruleInfo) return schoolThresholdDefault;
+    if (ruleInfo.ruleMode === 'sesuai_jadwal') {
+      if (hasTeachingTodayMain && personalBatasGuru) return personalBatasGuru;
+      return schoolThresholdDefault;
+    }
+    return schoolThresholdDefault;
+  })();
 
   // Schedule evaluation for the day currently being viewed/inspected in the UI
   const viewingScheduleEval = teacher
-    ? evaluateTeacherScheduleForDay(teacher, viewingHari, settings.jamMasukThreshold || '07:25', jadwalList)
+    ? evaluateTeacherScheduleForDay(teacher, viewingHari, schoolThresholdDefault, jadwalList, settings.attendanceRuleOverrides)
     : null;
 
   // Today's attendance log for this teacher if any
@@ -179,14 +196,17 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
         todayLog.jamDatang,
         teacher,
         hariIni,
-        settings.jamMasukThreshold || '07:25',
+        schoolThresholdDefault,
         settings.kebijakanKehadiran || 'instruksi_kepala_sekolah',
         jadwalList,
         settings.guruToleransiMenit || 0,
-        settings.guruTanpaJadwalWajibHadir || false
+        settings.guruTanpaJadwalWajibHadir || false,
+        undefined,
+        settings.attendanceRuleOverrides
       )
     : null;
   const expectedStatusForTodayLog = expectedEval?.status || null;
+  const effectiveTodayThreshold = expectedEval?.thresholdUsed || activeThreshold;
   const isStatusMismatched = Boolean(
     todayLog &&
     todayLog.status === 'Terlambat' &&
@@ -200,8 +220,8 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
       ...todayLog,
       status: 'Tepat Waktu',
       keterangan: (todayLog.keterangan || '').trim()
-        ? `${todayLog.keterangan} (Koreksi Jadwal Jam ${activeThreshold})`
-        : `Koreksi Jadwal Jam ${activeThreshold}`,
+        ? `${todayLog.keterangan} (Koreksi Jadwal Jam ${effectiveTodayThreshold})`
+        : `Koreksi Jadwal Jam ${effectiveTodayThreshold}`,
       peran: expectedEval?.peran || todayLog.peran,
       batasStaf: expectedEval?.batasStaf || todayLog.batasStaf,
       statusStaf: expectedEval?.statusStaf || todayLog.statusStaf,
@@ -215,7 +235,7 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
       setResultModal({
         status: 'success',
         title: 'Status Berhasil Diperbarui!',
-        message: `Status kehadiran ${teacher.nama} pada pukul ${todayLog.jamDatang} WIB telah disesuaikan menjadi Tepat Waktu (Batas jadwal hari ini: ${activeThreshold} WIB).`,
+        message: `Status kehadiran ${teacher.nama} pada pukul ${todayLog.jamDatang} WIB telah disesuaikan menjadi Tepat Waktu (Batas jadwal hari ini: ${effectiveTodayThreshold} WIB).`,
         jam: todayLog.jamDatang,
         statusPresensi: 'Tepat Waktu'
       });
@@ -430,7 +450,9 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
       settings.kebijakanKehadiran || 'instruksi_kepala_sekolah',
       jadwalList,
       settings.guruToleransiMenit || 0,
-      settings.guruTanpaJadwalWajibHadir || false
+      settings.guruTanpaJadwalWajibHadir || false,
+      undefined,
+      settings.attendanceRuleOverrides
     );
     const status: StatusPresensi = evalResult.status;
 
@@ -520,9 +542,29 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
         </div>
 
         {/* Live Date Pill */}
-        <div className="mt-3 flex items-center gap-2 text-xs text-blue-100 font-medium">
+        <div className="mt-3 flex flex-wrap items-center gap-1.5 text-xs text-blue-100 font-medium">
           <Clock className="w-3.5 h-3.5 text-yellow-300 shrink-0" />
-          <span>{hariIni}, {todayISO} &bull; Batas Masuk: <strong>{settings.jamMasukThreshold || '07:25'} WIB</strong></span>
+          <span>
+            {hariIni}, {todayISO} &bull;{' '}
+            {teacher && ruleInfo ? (
+              ruleInfo.ruleMode === 'sesuai_jadwal' ? (
+                hasTeachingTodayMain && personalBatasGuru ? (
+                  <>Batas Masuk Anda Hari Ini: <strong className="text-yellow-200">{personalBatasGuru} WIB</strong> (Sesuai Jadwal)</>
+                ) : settings.guruTanpaJadwalWajibHadir ? (
+                  <>Wajib Hadir: <strong className="text-yellow-200">{schoolThresholdDefault} WIB</strong></>
+                ) : (
+                  <>Hari Ini <strong className="text-yellow-200">Tidak Ada Jam Mengajar</strong></>
+                )
+              ) : (
+                <>
+                  {ruleInfo.isGuruBk ? 'Wajib Hadir Guru BK' : 'Wajib Hadir Harian'}:{' '}
+                  <strong className="text-yellow-200">{schoolThresholdDefault} WIB</strong>
+                </>
+              )
+            ) : (
+              <>Batas Staf/BK: <strong>{schoolThresholdDefault} WIB</strong> &bull; Guru: Sesuai Jadwal</>
+            )}
+          </span>
         </div>
       </div>
 
@@ -561,7 +603,8 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
         {/* Selected Teacher Quick Summary */}
         {teacher ? (
           (() => {
-            const teacherPeran = determineTeacherPeran(teacher, jadwalList);
+            const resolvedRule = ruleInfo || resolveTeacherAttendanceRule(teacher, jadwalList, undefined, settings.attendanceRuleOverrides);
+            const teacherPeran = resolvedRule.peran;
             const hasTeachingToday = Boolean(scheduleEval?.hasTeachingSchedule && scheduleEval.sesiList.length > 0);
             const firstTime = scheduleEval?.firstScheduleTime || '07:30';
             const batasGuru = minutesToTime(Math.max(0, (timeToMinutes(firstTime) ?? 450) - (settings.guruToleransiMenit || 0)));
@@ -576,6 +619,10 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
                       <span className={`px-2 py-0.5 rounded-md text-[10px] font-black border ${
                         teacherPeran === 'Guru'
                           ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                          : teacherPeran === 'Guru BK'
+                          ? 'bg-teal-50 text-teal-800 border-teal-200'
+                          : teacherPeran === 'Guru BK+Mengajar'
+                          ? 'bg-purple-50 text-purple-800 border-purple-200'
                           : teacherPeran === 'Guru+Staf'
                           ? 'bg-amber-50 text-amber-800 border-amber-200'
                           : 'bg-slate-100 text-slate-700 border-slate-300'
@@ -585,17 +632,20 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
                     </div>
 
                     <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                      {teacherPeran === 'Staf' && (
-                        <span className="px-2 py-0.5 bg-slate-200 text-slate-700 font-semibold rounded-md text-[10.5px]">
-                          Batas Staf: <strong className="text-slate-900">{batasStaf} WIB</strong>
+                      {resolvedRule.ruleMode === 'wajib_harian' && (
+                        <span className={`px-2 py-0.5 font-semibold rounded-md text-[10.5px] ${
+                          resolvedRule.isGuruBk ? 'bg-teal-100 text-teal-900' : 'bg-slate-200 text-slate-700'
+                        }`}>
+                          {resolvedRule.isGuruBk ? 'Wajib Hadir Guru BK' : 'Wajib Hadir Harian'}:{' '}
+                          <strong className="text-slate-900">{batasStaf} WIB</strong>
                         </span>
                       )}
 
-                      {teacherPeran === 'Guru' && (
+                      {resolvedRule.ruleMode === 'sesuai_jadwal' && (
                         hasTeachingToday ? (
                           <span className="px-2 py-0.5 bg-blue-100/90 text-blue-900 font-semibold rounded-md text-[10.5px]">
-                            Batas Mengajar: <strong className="text-slate-900">{batasGuru} WIB</strong>
-                            {settings.guruToleransiMenit > 0 && ` (Toleransi ${settings.guruToleransiMenit}m)`}
+                            Batas Masuk Anda Hari Ini: <strong className="text-slate-900">{batasGuru} WIB</strong> (Sesuai Jadwal)
+                            {settings.guruToleransiMenit > 0 && ` • Toleransi ${settings.guruToleransiMenit}m`}
                           </span>
                         ) : (
                           <span className={`px-2 py-0.5 rounded-md text-[10.5px] font-semibold ${
@@ -604,16 +654,19 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
                               : 'bg-emerald-100 text-emerald-800'
                           }`}>
                             {settings.guruTanpaJadwalWajibHadir
-                              ? `Wajib Hadir Staf: ${batasStaf} WIB`
-                              : 'Tidak Ada Jam Mengajar (Tidak wajib hadir)'}
+                              ? `Wajib Hadir Harian: ${batasStaf} WIB`
+                              : 'Tidak Ada Jam Mengajar Hari Ini (Tidak wajib hadir)'}
                           </span>
                         )
                       )}
 
-                      {teacherPeran === 'Guru+Staf' && (
+                      {resolvedRule.ruleMode === 'ganda' && (
                         <>
-                          <span className="px-2 py-0.5 bg-slate-200 text-slate-700 font-semibold rounded-md text-[10.5px]">
-                            Batas Staf: <strong className="text-slate-900">{batasStaf} WIB</strong>
+                          <span className={`px-2 py-0.5 font-semibold rounded-md text-[10.5px] ${
+                            resolvedRule.isGuruBk ? 'bg-teal-100 text-teal-900' : 'bg-slate-200 text-slate-700'
+                          }`}>
+                            {resolvedRule.isGuruBk ? 'Wajib Hadir Guru BK' : 'Batas Staf'}:{' '}
+                            <strong className="text-slate-900">{batasStaf} WIB</strong>
                           </span>
                           {hasTeachingToday ? (
                             <span className="px-2 py-0.5 bg-blue-100/90 text-blue-900 font-semibold rounded-md text-[10.5px]">
@@ -761,13 +814,31 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
                     ))}
                   </div>
 
-                  {/* Keterangan Jam Ke-1 dan Penyelaras Kebijakan Kepsek */}
+                  {/* Keterangan Jam Ke-1 & Aturan Presensi Pribadi */}
                   <div className="p-2 bg-slate-100/70 rounded-lg text-[10px] text-slate-600 leading-relaxed border border-slate-200">
                     <p className="font-semibold text-slate-800 mb-0.5">
                       📌 {viewingScheduleEval.jamSatuKeterangan}
                     </p>
                     <p className="text-slate-500">
-                      Instruksi Kepala Sekolah: Hadir selambatnya <strong>{settings.jamMasukThreshold || '07:25'} WIB</strong> di sekolah. Toleransi jam mengajar dicatat sistem secara transparan.
+                      {resolvedRule.ruleMode === 'sesuai_jadwal' ? (
+                        <>
+                          Aturan Presensi ({teacherPeran}): Batas hadir tepat waktu hari {viewingHari} adalah{' '}
+                          <strong className="text-slate-800">
+                            {minutesToTime(Math.max(0, (timeToMinutes(viewingScheduleEval.firstScheduleTime || '07:30') ?? 450) - (settings.guruToleransiMenit || 0)))} WIB
+                          </strong>{' '}
+                          (sesuai jadwal jam masuk kelas pertama).
+                        </>
+                      ) : resolvedRule.isGuruBk ? (
+                        <>
+                          Aturan Guru BK: Wajib hadir harian maksimal <strong className="text-slate-800">{batasStaf} WIB</strong>
+                          {viewingScheduleEval.firstScheduleTime && ` & batas sesi mengajar pertama ${viewingScheduleEval.firstScheduleTime} WIB`}.
+                        </>
+                      ) : (
+                        <>
+                          Aturan Staf/Jabatan: Wajib hadir harian maksimal <strong className="text-slate-800">{batasStaf} WIB</strong>
+                          {viewingScheduleEval.firstScheduleTime && ` & batas sesi mengajar pertama ${viewingScheduleEval.firstScheduleTime} WIB`}.
+                        </>
+                      )}
                     </p>
                   </div>
                 </div>
@@ -778,6 +849,8 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
                       <span className="text-amber-800 text-[10.5px] not-italic font-medium">
                         Jadwal belum terhubung (Kode Guru belum diisi di Master_Guru_Staf)
                       </span>
+                    ) : resolvedRule.isGuruBk ? (
+                      'Tugas Bimbingan & Konseling (Wajib Hadir sebagai Guru BK).'
                     ) : teacher.jabatan.toLowerCase().includes('guru') ? (
                       `Hari ${viewingHari} tidak ada jam tatap muka di kelas.`
                     ) : (
@@ -808,7 +881,7 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
                       <span className="text-[9.5px] text-slate-400 font-mono">6 Hari Sekolah</span>
                     </div>
                     {(['Sabtu', 'Ahad', 'Senin', 'Selasa', 'Rabu', 'Kamis'] as HariSekolah[]).map(day => {
-                      const dayEval = evaluateTeacherScheduleForDay(teacher, day, settings.jamMasukThreshold || '07:25', jadwalList);
+                      const dayEval = evaluateTeacherScheduleForDay(teacher, day, settings.jamMasukThreshold || '07:25', jadwalList, settings.attendanceRuleOverrides);
                       return (
                         <div
                           key={day}
@@ -1092,7 +1165,8 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
               </span>
             </div>
             <p className="text-[11px] text-slate-500 mt-1">
-              Batas Masuk Sekolah: <strong>{activeThreshold} WIB</strong>
+              Batas Presensi Anda: <strong>{effectiveTodayThreshold} WIB</strong>
+              {expectedEval?.peran ? ` (${expectedEval.peran})` : ''}
             </p>
 
             {/* Auto Correction Button if previously misflagged as Terlambat */}
@@ -1100,10 +1174,10 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
               <div className="mt-3 p-3 bg-amber-50 border border-amber-300 rounded-2xl text-left">
                 <p className="text-xs font-bold text-amber-900 flex items-center gap-1.5">
                   <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-                  <span>Koreksi Otomatis Jam Masuk ({activeThreshold} WIB):</span>
+                  <span>Koreksi Otomatis Jam Masuk ({effectiveTodayThreshold} WIB):</span>
                 </p>
                 <p className="text-[11px] text-amber-800 mt-1">
-                  Jam kedatangan Anda <strong>{todayLog.jamDatang} WIB</strong> tercatat sebelum batas <strong>{activeThreshold} WIB</strong>. Anda berhak berstatus <strong>Tepat Waktu</strong>.
+                  Jam kedatangan Anda <strong>{todayLog.jamDatang} WIB</strong> tercatat sebelum batas <strong>{effectiveTodayThreshold} WIB</strong>. Anda berhak berstatus <strong>Tepat Waktu</strong>.
                 </p>
                 <button
                   onClick={handleCorrectStatus}

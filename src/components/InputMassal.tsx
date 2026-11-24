@@ -56,6 +56,7 @@ const STATUS_OPTIONS: StatusPresensi[] = [
   'Cuti',
   'Alpa (Jadwal Mengajar)',
   'Alpa (Wajib Hadir Staf)',
+  'Alpa (Wajib Hadir Guru BK)',
   'Alpa',
   'Dinas Luar'
 ];
@@ -124,9 +125,20 @@ export const InputMassal: React.FC<InputMassalProps> = ({
         }
 
         let currentStatus = existing.status;
-        // Auto re-evaluate status against active threshold if status is Tepat Waktu or Terlambat
+        // Auto re-evaluate status against teacher's schedule & rule if status is Tepat Waktu or Terlambat
         if (cleanJam && (currentStatus === 'Tepat Waktu' || currentStatus === 'Terlambat')) {
-          currentStatus = evaluateStatus24h(cleanJam, threshold);
+          currentStatus = evaluateTeacherAttendanceStatus(
+            cleanJam,
+            guru,
+            selectedHari,
+            threshold,
+            settings?.kebijakanKehadiran || 'instruksi_kepala_sekolah',
+            jadwalList,
+            settings?.guruToleransiMenit || 0,
+            settings?.guruTanpaJadwalWajibHadir || false,
+            undefined,
+            settings?.attendanceRuleOverrides
+          ).status;
         }
 
         newMap.set(guru.nama, {
@@ -160,11 +172,19 @@ export const InputMassal: React.FC<InputMassalProps> = ({
     return Array.from(set).sort();
   }, [masterList]);
 
+  const teacherByName = useMemo(() => {
+    const map = new Map<string, MasterGuruStaf>();
+    masterList.forEach((m) => map.set(m.nama, m));
+    return map;
+  }, [masterList]);
+
   // Filtered master list based on search, jabatan, and daily schedule
   const filteredList = useMemo(() => {
     const teachersOnDay = showAllUnscheduled
       ? masterList
-      : masterList.filter((m) => isTeacherWajibHadir(m, selectedHari, jadwalList, settings?.guruTanpaJadwalWajibHadir));
+      : masterList.filter((m) =>
+          isTeacherWajibHadir(m, selectedHari, jadwalList, settings?.guruTanpaJadwalWajibHadir, settings?.attendanceRuleOverrides)
+        );
     return teachersOnDay.filter((m) => {
       const matchSearch =
         m.nama.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -176,6 +196,7 @@ export const InputMassal: React.FC<InputMassalProps> = ({
 
   // Handle Jam Datang inline change
   const handleJamDatangChange = (nama: string, newTime: string) => {
+    const guru = teacherByName.get(nama);
     setRowStateMap((prev) => {
       const next = new Map<string, RowState>(prev);
       const current = next.get(nama) || { jamDatang: '', status: '', keterangan: '', isModified: false };
@@ -183,7 +204,20 @@ export const InputMassal: React.FC<InputMassalProps> = ({
       let nextStatus = current.status;
       // Auto-calculate status if status was unselected or was auto Tepat Waktu / Terlambat
       if (newTime && (!current.status || current.status === 'Tepat Waktu' || current.status === 'Terlambat')) {
-        nextStatus = evaluateStatus24h(newTime, threshold);
+        nextStatus = guru
+          ? evaluateTeacherAttendanceStatus(
+              newTime,
+              guru,
+              selectedHari,
+              threshold,
+              settings?.kebijakanKehadiran || 'instruksi_kepala_sekolah',
+              jadwalList,
+              settings?.guruToleransiMenit || 0,
+              settings?.guruTanpaJadwalWajibHadir || false,
+              undefined,
+              settings?.attendanceRuleOverrides
+            ).status
+          : evaluateStatus24h(newTime, threshold);
       }
 
       next.set(nama, {
@@ -203,7 +237,7 @@ export const InputMassal: React.FC<InputMassalProps> = ({
       const current = next.get(nama) || { jamDatang: '', status: '', keterangan: '', isModified: false };
       
       let nextJam = current.jamDatang;
-      if (['Cuti', 'Izin', 'Sakit', 'Alpa', 'Alpa (Jadwal Mengajar)', 'Alpa (Wajib Hadir Staf)', 'Dinas Luar'].includes(newStatus)) {
+      if (['Cuti', 'Izin', 'Sakit', 'Alpa', 'Alpa (Jadwal Mengajar)', 'Alpa (Wajib Hadir Staf)', 'Alpa (Wajib Hadir Guru BK)', 'Dinas Luar'].includes(newStatus)) {
         nextJam = ''; // or empty time
       }
 
@@ -311,8 +345,8 @@ export const InputMassal: React.FC<InputMassalProps> = ({
       if (!state.jamDatang.trim() && !state.status) return;
 
       const finalJam = state.jamDatang.trim() || '-';
-      const scheduleEval = evaluateTeacherScheduleForDay(guru, selectedHari, threshold, jadwalList);
-      const mapel = scheduleEval.hasTeachingSchedule ? scheduleEval.mapelHariIni : getMapelHariIni(guru, selectedHari);
+      const scheduleEval = evaluateTeacherScheduleForDay(guru, selectedHari, threshold, jadwalList, settings?.attendanceRuleOverrides);
+      const mapel = scheduleEval.hasTeachingSchedule ? scheduleEval.mapelHariIni : getMapelHariIni(guru, selectedHari, jadwalList);
 
       let finalStatus: StatusPresensi = state.status || 'Tepat Waktu';
       let peranVal: string | undefined = undefined;
@@ -332,7 +366,9 @@ export const InputMassal: React.FC<InputMassalProps> = ({
           settings?.kebijakanKehadiran || 'instruksi_kepala_sekolah',
           jadwalList,
           settings?.guruToleransiMenit || 0,
-          settings?.guruTanpaJadwalWajibHadir || false
+          settings?.guruTanpaJadwalWajibHadir || false,
+          undefined,
+          settings?.attendanceRuleOverrides
         );
         finalStatus = state.status || evalRes.status;
         peranVal = evalRes.peran;
@@ -635,8 +671,8 @@ export const InputMassal: React.FC<InputMassalProps> = ({
                     isModified: false
                   };
 
-                  const scheduleEval = evaluateTeacherScheduleForDay(m, selectedHari);
-                  const mapelHariIni = scheduleEval.hasTeachingSchedule ? scheduleEval.mapelHariIni : getMapelHariIni(m, selectedHari);
+                  const scheduleEval = evaluateTeacherScheduleForDay(m, selectedHari, threshold, jadwalList, settings?.attendanceRuleOverrides);
+                  const mapelHariIni = scheduleEval.hasTeachingSchedule ? scheduleEval.mapelHariIni : getMapelHariIni(m, selectedHari, jadwalList);
                   const isRegistered = !!state.existingLogId;
 
                   return (

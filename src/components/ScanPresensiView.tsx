@@ -136,7 +136,9 @@ export const ScanPresensiView: React.FC<ScanPresensiViewProps> = ({
       settings.kebijakanKehadiran || 'instruksi_kepala_sekolah',
       jadwalList,
       settings.guruToleransiMenit || 0,
-      settings.guruTanpaJadwalWajibHadir || false
+      settings.guruTanpaJadwalWajibHadir || false,
+      undefined,
+      settings.attendanceRuleOverrides
     );
     const status: StatusPresensi = evalResult.status;
 

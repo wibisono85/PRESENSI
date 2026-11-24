@@ -1,4 +1,4 @@
-import { MasterGuruStaf, HariSekolah, StatusPresensi, AppSettings, JadwalSlot } from '../types';
+import { MasterGuruStaf, HariSekolah, StatusPresensi, AppSettings, JadwalSlot, AttendanceRuleMode } from '../types';
 import { timeToMinutes, minutesToTime, evaluateStatus24h } from './timeUtils';
 import { buildMapelString, isJadwalTidakDitemukan, cariKodeGuru, slotsDariOfficial } from './jadwalEngine';
 
@@ -471,67 +471,266 @@ export function parseAndFormatTigaSesi(rawSchedule: string): {
   };
 }
 
+export type EvaluatedPeran = 'Guru' | 'Staf' | 'Guru+Staf' | 'Guru BK' | 'Guru BK+Mengajar';
+
+const STRUCTURAL_OR_STAFF_KEYWORDS = [
+  'kepala sekolah',
+  'wakil kepala',
+  'wakasek',
+  'waka',
+  'kurikulum',
+  'kesiswaan',
+  'humas',
+  'sarpras',
+  'bendahara',
+  'tata usaha',
+  'subag',
+  'staf',
+  'staff',
+  'operator',
+  'satpam',
+  'keamanan',
+  'penjaga',
+  'kebersihan',
+  'teknisi',
+  'perpustakaan',
+  'pustakawan'
+];
+
+export function isGuruBkJabatan(jabatan?: string): boolean {
+  const j = (jabatan || '').trim().toLowerCase();
+  return (
+    /\bbk\b/.test(j) ||
+    j.includes('bimbingan konseling') ||
+    j.includes('bimbingan & konseling') ||
+    j.includes('konselor')
+  );
+}
+
+export function isStructuralOrStaffJabatan(jabatan?: string): boolean {
+  const j = (jabatan || '').trim().toLowerCase();
+  if (!j) return false;
+  if (STRUCTURAL_OR_STAFF_KEYWORDS.some((kw) => j.includes(kw))) {
+    return true;
+  }
+  if (/\btu\b/.test(j) || /\bops\b/.test(j)) {
+    return true;
+  }
+  return false;
+}
+
+export function getTeacherAttendanceOverride(
+  teacher: MasterGuruStaf | string,
+  attendanceRuleOverrides?: Record<string, AttendanceRuleMode>
+): AttendanceRuleMode | undefined {
+  if (!attendanceRuleOverrides) return undefined;
+  const rawName = typeof teacher === 'string' ? teacher : teacher.nama;
+  const key = (rawName || '').trim().toLowerCase();
+  if (!key) return undefined;
+  if (attendanceRuleOverrides[key]) return attendanceRuleOverrides[key];
+  for (const [k, v] of Object.entries(attendanceRuleOverrides)) {
+    if (k.trim().toLowerCase() === key) return v;
+  }
+  return undefined;
+}
+
+export interface ResolvedAttendanceRule {
+  peran: EvaluatedPeran;
+  ruleMode: AttendanceRuleMode;
+  isGuruBk: boolean;
+  isExplicitOverride: boolean;
+  hasSlotInJadwal: boolean;
+}
+
+export function resolveTeacherAttendanceRule(
+  teacher: MasterGuruStaf,
+  jadwal?: JadwalSlot[],
+  peranOverride?: string,
+  attendanceRuleOverrides?: Record<string, AttendanceRuleMode>
+): ResolvedAttendanceRule {
+  const kodeGuru = cariKodeGuru(teacher);
+  let hasSlotInJadwal = false;
+  if (kodeGuru !== null) {
+    const slots = jadwal && jadwal.length > 0 ? jadwal : slotsDariOfficial();
+    hasSlotInJadwal = slots.some((s) => s.kodeGuru === kodeGuru);
+  }
+
+  const isBk =
+    isGuruBkJabatan(teacher.jabatan) ||
+    (teacher.peran || '').toLowerCase().includes('bk') ||
+    (peranOverride || '').toLowerCase().includes('bk');
+
+  // 1. Explicit per-person override from AppSettings ("Pengaturan Wajib Hadir")
+  const appOverride = getTeacherAttendanceOverride(teacher, attendanceRuleOverrides);
+  if (appOverride === 'sesuai_jadwal') {
+    return {
+      peran: isBk ? 'Guru BK' : 'Guru',
+      ruleMode: 'sesuai_jadwal',
+      isGuruBk: isBk,
+      isExplicitOverride: true,
+      hasSlotInJadwal
+    };
+  }
+  if (appOverride === 'wajib_harian') {
+    return {
+      peran: isBk ? 'Guru BK' : 'Staf',
+      ruleMode: 'wajib_harian',
+      isGuruBk: isBk,
+      isExplicitOverride: true,
+      hasSlotInJadwal
+    };
+  }
+  if (appOverride === 'ganda') {
+    return {
+      peran: isBk ? 'Guru BK+Mengajar' : 'Guru+Staf',
+      ruleMode: 'ganda',
+      isGuruBk: isBk,
+      isExplicitOverride: true,
+      hasSlotInJadwal
+    };
+  }
+
+  // 2. Explicit peranOverride parameter or teacher.peran column from Master_Guru_Staf
+  const rawPeran = (peranOverride || teacher.peran || '').trim();
+  if (rawPeran === 'Guru') {
+    return {
+      peran: isBk ? 'Guru BK' : 'Guru',
+      ruleMode: 'sesuai_jadwal',
+      isGuruBk: isBk,
+      isExplicitOverride: false,
+      hasSlotInJadwal
+    };
+  }
+  if (rawPeran === 'Guru BK') {
+    return {
+      peran: 'Guru BK',
+      ruleMode: 'wajib_harian',
+      isGuruBk: true,
+      isExplicitOverride: false,
+      hasSlotInJadwal
+    };
+  }
+  if (rawPeran === 'Guru BK+Mengajar') {
+    return {
+      peran: 'Guru BK+Mengajar',
+      ruleMode: 'ganda',
+      isGuruBk: true,
+      isExplicitOverride: false,
+      hasSlotInJadwal
+    };
+  }
+  if (rawPeran === 'Staf') {
+    return {
+      peran: isBk ? 'Guru BK' : 'Staf',
+      ruleMode: 'wajib_harian',
+      isGuruBk: isBk,
+      isExplicitOverride: false,
+      hasSlotInJadwal
+    };
+  }
+  if (rawPeran === 'Guru+Staf') {
+    return {
+      peran: isBk ? 'Guru BK+Mengajar' : 'Guru+Staf',
+      ruleMode: 'ganda',
+      isGuruBk: isBk,
+      isExplicitOverride: false,
+      hasSlotInJadwal
+    };
+  }
+
+  // 3. Automatic smart resolution
+  if (isBk) {
+    if (hasSlotInJadwal) {
+      return {
+        peran: 'Guru BK+Mengajar',
+        ruleMode: 'ganda',
+        isGuruBk: true,
+        isExplicitOverride: false,
+        hasSlotInJadwal
+      };
+    }
+    return {
+      peran: 'Guru BK',
+      ruleMode: 'wajib_harian',
+      isGuruBk: true,
+      isExplicitOverride: false,
+      hasSlotInJadwal
+    };
+  }
+
+  if (hasSlotInJadwal) {
+    if (isStructuralOrStaffJabatan(teacher.jabatan)) {
+      return {
+        peran: 'Guru+Staf',
+        ruleMode: 'ganda',
+        isGuruBk: false,
+        isExplicitOverride: false,
+        hasSlotInJadwal
+      };
+    }
+    // Regular subject teachers (including Wali Kelas) follow their teaching schedule
+    return {
+      peran: 'Guru',
+      ruleMode: 'sesuai_jadwal',
+      isGuruBk: false,
+      isExplicitOverride: false,
+      hasSlotInJadwal
+    };
+  }
+
+  return {
+    peran: 'Staf',
+    ruleMode: 'wajib_harian',
+    isGuruBk: false,
+    isExplicitOverride: false,
+    hasSlotInJadwal: false
+  };
+}
+
 /**
- * Resolves teacher role strictly:
- * 'Guru' | 'Staf' | 'Guru+Staf'
- * - Taken from teacher.peran ('Guru' | 'Staf' | 'Guru+Staf')
- * - If empty:
- *   - Has teaching schedule (kodeGuru connected and has slot in schedule) & jabatan "Guru Mata Pelajaran" -> 'Guru'
- *   - Has schedule and other structural position -> 'Guru+Staf'
- *   - Does not have schedule -> 'Staf'
+ * Resolves teacher role label:
+ * 'Guru' | 'Staf' | 'Guru+Staf' | 'Guru BK' | 'Guru BK+Mengajar'
  */
 export function determineTeacherPeran(
   teacher: MasterGuruStaf,
   jadwal?: JadwalSlot[],
-  peranOverride?: string
-): 'Guru' | 'Staf' | 'Guru+Staf' {
-  if (peranOverride && (peranOverride === 'Guru' || peranOverride === 'Staf' || peranOverride === 'Guru+Staf')) {
-    return peranOverride;
-  }
-  if (teacher.peran) {
-    const p = teacher.peran.trim();
-    if (p === 'Guru' || p === 'Staf' || p === 'Guru+Staf') {
-      return p;
-    }
-  }
+  peranOverride?: string,
+  attendanceRuleOverrides?: Record<string, AttendanceRuleMode>
+): EvaluatedPeran {
+  return resolveTeacherAttendanceRule(teacher, jadwal, peranOverride, attendanceRuleOverrides).peran;
+}
 
-  const kodeGuru = cariKodeGuru(teacher);
-  let hasSlotInJadwal = false;
-  if (kodeGuru !== null) {
-    const slots = (jadwal && jadwal.length > 0) ? jadwal : slotsDariOfficial();
-    hasSlotInJadwal = slots.some(s => s.kodeGuru === kodeGuru);
+export function getDefaultAlpaStatus(
+  teacher: MasterGuruStaf,
+  jadwal?: JadwalSlot[],
+  attendanceRuleOverrides?: Record<string, AttendanceRuleMode>
+): StatusPresensi {
+  const rule = resolveTeacherAttendanceRule(teacher, jadwal, undefined, attendanceRuleOverrides);
+  if (rule.ruleMode === 'sesuai_jadwal') {
+    return 'Alpa (Jadwal Mengajar)';
   }
-
-  if (hasSlotInJadwal) {
-    const jab = (teacher.jabatan || '').trim().toLowerCase();
-    if (jab === 'guru mata pelajaran') {
-      return 'Guru';
-    }
-    return 'Guru+Staf';
-  }
-
-  return 'Staf';
+  return rule.isGuruBk ? 'Alpa (Wajib Hadir Guru BK)' : 'Alpa (Wajib Hadir Staf)';
 }
 
 /**
  * Checks whether a teacher/staff is required to attend on a given day:
  * - Jumat: libur sekolah (false)
- * - Staf and Guru+Staf: always required on school days (true)
- * - Guru: only required if having teaching sessions that day, or guruTanpaJadwalWajibHadir = true
+ * - wajib_harian & ganda: always required on school days (true)
+ * - sesuai_jadwal: only required if having teaching sessions that day, or guruTanpaJadwalWajibHadir = true
  */
 export function isTeacherWajibHadir(
   teacher: MasterGuruStaf,
   hari: HariSekolah,
   jadwal?: JadwalSlot[],
-  guruTanpaJadwalWajibHadir: boolean = false
+  guruTanpaJadwalWajibHadir: boolean = false,
+  attendanceRuleOverrides?: Record<string, AttendanceRuleMode>
 ): boolean {
   if (hari === 'Jumat') return false;
-  const peran = determineTeacherPeran(teacher, jadwal);
-  if (peran === 'Staf' || peran === 'Guru+Staf') {
+  const rule = resolveTeacherAttendanceRule(teacher, jadwal, undefined, attendanceRuleOverrides);
+  if (rule.ruleMode === 'wajib_harian' || rule.ruleMode === 'ganda') {
     return true;
   }
-  // Guru
-  const scheduleEval = evaluateTeacherScheduleForDay(teacher, hari, '07:25', jadwal);
+  const scheduleEval = evaluateTeacherScheduleForDay(teacher, hari, '07:25', jadwal, attendanceRuleOverrides);
   if (scheduleEval.hasTeachingSchedule && scheduleEval.sesiList.length > 0) {
     return true;
   }
@@ -545,12 +744,16 @@ export function evaluateTeacherScheduleForDay(
   teacher: MasterGuruStaf,
   hari: HariSekolah,
   defaultThreshold: string = '07:25',
-  jadwal?: JadwalSlot[]
+  jadwal?: JadwalSlot[],
+  attendanceRuleOverrides?: Record<string, AttendanceRuleMode>
 ): TeacherDailyScheduleEvaluation {
+  const rule = resolveTeacherAttendanceRule(teacher, jadwal, undefined, attendanceRuleOverrides);
+  const isDailyNonTeaching = rule.ruleMode !== 'sesuai_jadwal';
+
   if (isJadwalTidakDitemukan(teacher)) {
     return {
       hasTeachingSchedule: false,
-      isStaffOnly: false,
+      isStaffOnly: isDailyNonTeaching && !rule.isGuruBk,
       mapelHariIni: 'Jadwal belum terhubung (Kode Guru belum diisi di Master_Guru_Staf)',
       ringkasanSesiText: 'Jadwal belum terhubung',
       jamSatuKelas: null,
@@ -564,20 +767,38 @@ export function evaluateTeacherScheduleForDay(
   }
 
   const mapelRaw = buildMapelString(teacher, hari, jadwal);
-  const peran = determineTeacherPeran(teacher, jadwal);
-  const isStaff = peran === 'Staf';
-
   const trimmed = (mapelRaw || '').trim();
   const hasTeachingSchedule = trimmed !== '' && trimmed !== '-' && trimmed.toLowerCase() !== 'libur';
 
   if (!hasTeachingSchedule) {
+    if (rule.isGuruBk && rule.ruleMode !== 'sesuai_jadwal') {
+      return {
+        hasTeachingSchedule: false,
+        isStaffOnly: false,
+        mapelHariIni: 'Tugas Bimbingan & Konseling (Guru BK)',
+        ringkasanSesiText: 'Jam Kerja Harian Guru BK',
+        jamSatuKelas: null,
+        jamSatuKeterangan: 'Wajib hadir harian sekolah sebagai Guru BK',
+        firstScheduleTime: null,
+        startJamKe: null,
+        thresholdTime: defaultThreshold,
+        sesiList: [],
+        keteranganJadwal: 'Kehadiran Harian Guru BK'
+      };
+    }
+
+    const isStaff = rule.ruleMode === 'wajib_harian' && !rule.isGuruBk;
     return {
       hasTeachingSchedule: false,
       isStaffOnly: isStaff,
       mapelHariIni: isStaff ? 'Tugas Kantor / Operasional Sekolah' : 'Tidak Ada Jam Mengajar Hari Ini',
       ringkasanSesiText: isStaff ? 'Jam Kerja Staf Sekolah' : 'Libur Jam Mengajar',
       jamSatuKelas: null,
-      jamSatuKeterangan: isStaff ? 'Wajib hadir pagi kantor sekolah' : 'Tidak ada jadwal jam ke-1 di kelas',
+      jamSatuKeterangan: isStaff
+        ? 'Wajib hadir pagi kantor sekolah'
+        : rule.ruleMode === 'ganda'
+        ? 'Wajib hadir harian sekolah (tidak ada jadwal kelas)'
+        : 'Tidak ada jadwal jam ke-1 di kelas',
       firstScheduleTime: null,
       startJamKe: null,
       thresholdTime: defaultThreshold,
@@ -625,34 +846,32 @@ export function evaluateTeacherScheduleForDay(
 }
 
 export interface AttendanceEvaluationResult {
-  status: StatusPresensi; // Status umum ('Terlambat' jika statusStaf ATAU statusMengajar terlambat; selain itu 'Tepat Waktu')
-  statusKepalaSekolah: StatusPresensi; // statusStaf (alias)
-  statusJadwalMengajar: StatusPresensi; // statusMengajar (alias)
-  thresholdSekolah: string; // '07:25'
-  thresholdJadwal: string; // '08:30' etc.
-  thresholdUsed: string; // Primary effective threshold
+  status: StatusPresensi;
+  statusKepalaSekolah: StatusPresensi;
+  statusJadwalMengajar: StatusPresensi;
+  thresholdSekolah: string;
+  thresholdJadwal: string;
+  thresholdUsed: string;
   isScheduleBased: boolean;
-  keterangan: string; // Explanatory note
-  ringkasanSesi: string; // e.g. "Jam III-IV: Akhlak (Kelas VII D)"
+  keterangan: string;
+  ringkasanSesi: string;
   jamSatuInfo: string;
 
-  // New role-based fields according to Tahap 2 rules
-  peran: 'Guru' | 'Staf' | 'Guru+Staf';
+  peran: EvaluatedPeran;
+  ruleMode: AttendanceRuleMode;
+  isGuruBk: boolean;
   wajibHadir: boolean;
   batasStaf: string | null;
-  statusStaf: string | null; // 'Tepat Waktu' | 'Terlambat' | null
+  statusStaf: string | null;
   batasMengajar: string | null;
-  statusMengajar: string | null; // 'Tepat Waktu' | 'Terlambat' | null
+  statusMengajar: string | null;
 }
 
 /**
- * Attendance Evaluator based on Official School Owner Decision (Tahap 2):
- * - Staf: batasStaf = settings.jamMasukThreshold (default 07:25). Wajib hadir setiap hari sekolah.
- * - Guru: batasGuru = jam mulai sesi mengajar PERTAMA hari itu - settings.guruToleransiMenit (Jam I-II 07:30, Jam III-IV 08:30, Jam V-VI 10:00).
- *   Jika tidak ada sesi mengajar: wajib hadir bila settings.guruTanpaJadwalWajibHadir = true;
- *   jika false, tidak wajib hadir dan jika tetap hadir dicatat "Hadir (tanpa jadwal mengajar)" dengan status umum Tepat Waktu.
- * - Guru+Staf: DUA penilaian terpisah: statusStaf & statusMengajar (hanya jika ada jadwal mengajar hari itu).
- * - Status umum = 'Terlambat' jika statusStaf ATAU statusMengajar terlambat; selain itu 'Tepat Waktu'.
+ * Attendance Evaluator supporting:
+ * - 'sesuai_jadwal' (Guru & personel terjadwal): batasMengajar = jam mulai sesi pertama - guruToleransiMenit
+ * - 'wajib_harian' (Staf, Guru BK harian, atau guru wajib hadir harian): batasStaf = settings.jamMasukThreshold (default 07:25)
+ * - 'ganda' (Guru+Staf & Guru BK+Mengajar): DUA penilaian terpisah (batas harian 07:25 & jam mengajar)
  */
 export function evaluateTeacherAttendanceStatus(
   jamDatangStr: string,
@@ -663,18 +882,20 @@ export function evaluateTeacherAttendanceStatus(
   jadwal?: JadwalSlot[],
   guruToleransiMenit: number = 0,
   guruTanpaJadwalWajibHadir: boolean = false,
-  peranOverride?: string
+  peranOverride?: string,
+  attendanceRuleOverrides?: Record<string, AttendanceRuleMode>
 ): AttendanceEvaluationResult {
-  const peran = determineTeacherPeran(teacher, jadwal, peranOverride);
-  const scheduleEval = evaluateTeacherScheduleForDay(teacher, hari, schoolThreshold, jadwal);
+  const rule = resolveTeacherAttendanceRule(teacher, jadwal, peranOverride, attendanceRuleOverrides);
+  const { peran, ruleMode, isGuruBk } = rule;
+  const scheduleEval = evaluateTeacherScheduleForDay(teacher, hari, schoolThreshold, jadwal, attendanceRuleOverrides);
   const hasTeachingToday = scheduleEval.hasTeachingSchedule && scheduleEval.sesiList.length > 0;
   const effectiveSchoolThreshold = schoolThreshold || '07:25';
 
-  // 1. Batas & Status Staf
+  // 1. Batas & Status Harian (Staf / Guru BK / Wajib Harian)
   let batasStaf: string | null = null;
   let statusStaf: string | null = null;
 
-  if (peran === 'Staf' || peran === 'Guru+Staf') {
+  if (ruleMode === 'wajib_harian' || ruleMode === 'ganda') {
     batasStaf = effectiveSchoolThreshold;
     statusStaf = evaluateStatus24h(jamDatangStr, batasStaf);
   }
@@ -683,7 +904,7 @@ export function evaluateTeacherAttendanceStatus(
   let batasMengajar: string | null = null;
   let statusMengajar: string | null = null;
 
-  if (hasTeachingToday && (peran === 'Guru' || peran === 'Guru+Staf')) {
+  if (hasTeachingToday && (ruleMode === 'sesuai_jadwal' || ruleMode === 'ganda')) {
     const firstScheduleTime = scheduleEval.firstScheduleTime || '07:30';
     const startMins = timeToMinutes(firstScheduleTime) ?? 450;
     const toleransi = Math.max(0, guruToleransiMenit || 0);
@@ -694,7 +915,7 @@ export function evaluateTeacherAttendanceStatus(
 
   // 3. Wajib Hadir
   let wajibHadir = true;
-  if (peran === 'Guru') {
+  if (ruleMode === 'sesuai_jadwal') {
     wajibHadir = hasTeachingToday ? true : Boolean(guruTanpaJadwalWajibHadir);
   } else {
     wajibHadir = true;
@@ -702,64 +923,78 @@ export function evaluateTeacherAttendanceStatus(
 
   // 4. Status Umum (StatusPresensi)
   let status: StatusPresensi = 'Tepat Waktu';
-  if (peran === 'Staf') {
+  if (ruleMode === 'wajib_harian') {
     status = statusStaf === 'Terlambat' ? 'Terlambat' : 'Tepat Waktu';
-  } else if (peran === 'Guru') {
+  } else if (ruleMode === 'sesuai_jadwal') {
     if (hasTeachingToday) {
       status = statusMengajar === 'Terlambat' ? 'Terlambat' : 'Tepat Waktu';
+    } else if (guruTanpaJadwalWajibHadir) {
+      status = evaluateStatus24h(jamDatangStr, effectiveSchoolThreshold);
     } else {
-      if (guruTanpaJadwalWajibHadir) {
-        status = evaluateStatus24h(jamDatangStr, effectiveSchoolThreshold);
-      } else {
-        status = 'Tepat Waktu';
-      }
+      status = 'Tepat Waktu';
     }
-  } else if (peran === 'Guru+Staf') {
+  } else {
+    // ganda
     if (hasTeachingToday) {
-      status = (statusStaf === 'Terlambat' || statusMengajar === 'Terlambat') ? 'Terlambat' : 'Tepat Waktu';
+      status = statusStaf === 'Terlambat' || statusMengajar === 'Terlambat' ? 'Terlambat' : 'Tepat Waktu';
     } else {
       status = statusStaf === 'Terlambat' ? 'Terlambat' : 'Tepat Waktu';
     }
   }
 
+  // Label peran harian (agar Guru BK tidak disebut "sbg Staf")
+  const dailyRoleLabel = isGuruBk
+    ? 'sbg Guru BK'
+    : isStructuralOrStaffJabatan(teacher.jabatan)
+    ? 'sbg Staf'
+    : 'Wajib Harian';
+
   // 5. Keterangan Rinci
   let keterangan = '';
-  if (peran === 'Guru+Staf') {
-    const stafKet = statusStaf === 'Terlambat'
-      ? `Terlambat sbg Staf (${jamDatangStr} > ${batasStaf})`
-      : `Tepat Waktu sbg Staf (${jamDatangStr} <= ${batasStaf})`;
+  if (ruleMode === 'ganda') {
+    const stafKet =
+      statusStaf === 'Terlambat'
+        ? `Terlambat ${dailyRoleLabel} (${jamDatangStr} > ${batasStaf})`
+        : `Tepat Waktu ${dailyRoleLabel} (${jamDatangStr} <= ${batasStaf})`;
     if (hasTeachingToday && batasMengajar) {
       const firstSesi = scheduleEval.sesiList[0];
       const sesiLabel = firstSesi ? `${firstSesi.labelJam} ${firstSesi.jamMulai}` : batasMengajar;
-      const ajarKet = statusMengajar === 'Terlambat'
-        ? `Terlambat mengajar (${jamDatangStr} > ${batasMengajar} ${sesiLabel})`
-        : `Tepat Waktu mengajar (${sesiLabel})`;
+      const ajarKet =
+        statusMengajar === 'Terlambat'
+          ? `Terlambat mengajar (${jamDatangStr} > ${batasMengajar} ${sesiLabel})`
+          : `Tepat Waktu mengajar (${sesiLabel})`;
       keterangan = `${stafKet} • ${ajarKet}`;
     } else {
       keterangan = `${stafKet} • Tidak ada jadwal mengajar hari ini`;
     }
-  } else if (peran === 'Guru') {
+  } else if (ruleMode === 'sesuai_jadwal') {
     if (hasTeachingToday && batasMengajar) {
       const firstSesi = scheduleEval.sesiList[0];
       const sesiLabel = firstSesi ? `${firstSesi.labelJam} ${firstSesi.jamMulai}` : batasMengajar;
-      const tolText = (guruToleransiMenit && guruToleransiMenit > 0) ? ` (Toleransi ${guruToleransiMenit}m, Batas: ${batasMengajar})` : '';
-      keterangan = statusMengajar === 'Terlambat'
-        ? `Terlambat mengajar (${jamDatangStr} > ${batasMengajar} • ${sesiLabel})`
-        : `Tepat Waktu mengajar (${sesiLabel}${tolText})`;
+      const tolText =
+        guruToleransiMenit && guruToleransiMenit > 0
+          ? ` (Toleransi ${guruToleransiMenit}m, Batas: ${batasMengajar})`
+          : '';
+      keterangan =
+        statusMengajar === 'Terlambat'
+          ? `Terlambat mengajar (${jamDatangStr} > ${batasMengajar} • ${sesiLabel})`
+          : `Tepat Waktu mengajar (${sesiLabel}${tolText})`;
     } else {
       if (!guruTanpaJadwalWajibHadir) {
-        keterangan = 'Hadir (tanpa jadwal mengajar)';
+        keterangan = isGuruBk ? 'Hadir sbg Guru BK (tanpa jadwal mengajar kelas)' : 'Hadir (tanpa jadwal mengajar)';
       } else {
-        keterangan = status === 'Terlambat'
-          ? `Terlambat (${jamDatangStr} > ${effectiveSchoolThreshold}) • Tanpa jadwal mengajar (Wajib hadir)`
-          : `Tepat Waktu (${jamDatangStr} <= ${effectiveSchoolThreshold}) • Tanpa jadwal mengajar`;
+        keterangan =
+          status === 'Terlambat'
+            ? `Terlambat (${jamDatangStr} > ${effectiveSchoolThreshold}) • Tanpa jadwal mengajar (Wajib hadir)`
+            : `Tepat Waktu (${jamDatangStr} <= ${effectiveSchoolThreshold}) • Tanpa jadwal mengajar`;
       }
     }
   } else {
-    // Staf
-    keterangan = statusStaf === 'Terlambat'
-      ? `Terlambat sbg Staf (${jamDatangStr} > ${batasStaf})`
-      : `Tepat Waktu sbg Staf (${jamDatangStr} <= ${batasStaf})`;
+    // wajib_harian
+    keterangan =
+      statusStaf === 'Terlambat'
+        ? `Terlambat ${dailyRoleLabel} (${jamDatangStr} > ${batasStaf})`
+        : `Tepat Waktu ${dailyRoleLabel} (${jamDatangStr} <= ${batasStaf})`;
   }
 
   // 6. Backward Compatibility Mappings
@@ -767,8 +1002,11 @@ export function evaluateTeacherAttendanceStatus(
   const statusJadwalMengajar: StatusPresensi = (statusMengajar as StatusPresensi) || status;
   const thresholdSekolah = batasStaf || effectiveSchoolThreshold;
   const thresholdJadwal = batasMengajar || scheduleEval.thresholdTime || effectiveSchoolThreshold;
-  const thresholdUsed = peran === 'Guru' ? (batasMengajar || effectiveSchoolThreshold) : (batasStaf || effectiveSchoolThreshold);
-  const isScheduleBased = peran === 'Guru' || (peran === 'Guru+Staf' && hasTeachingToday);
+  const thresholdUsed =
+    ruleMode === 'sesuai_jadwal'
+      ? batasMengajar || effectiveSchoolThreshold
+      : batasStaf || effectiveSchoolThreshold;
+  const isScheduleBased = ruleMode === 'sesuai_jadwal' || (ruleMode === 'ganda' && hasTeachingToday);
 
   return {
     status,
@@ -782,6 +1020,8 @@ export function evaluateTeacherAttendanceStatus(
     ringkasanSesi: scheduleEval.ringkasanSesiText,
     jamSatuInfo: scheduleEval.jamSatuKeterangan,
     peran,
+    ruleMode,
+    isGuruBk,
     wajibHadir,
     batasStaf,
     statusStaf,
@@ -789,3 +1029,4 @@ export function evaluateTeacherAttendanceStatus(
     statusMengajar
   };
 }
+

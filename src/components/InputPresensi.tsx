@@ -14,7 +14,8 @@ import {
   evaluateTeacherAttendanceStatus,
   evaluateTeacherScheduleForDay,
   isTeacherWajibHadir,
-  determineTeacherPeran
+  determineTeacherPeran,
+  resolveTeacherAttendanceRule
 } from '../utils/scheduleTimeEvaluator';
 import {
   JENIS_CUTI_OPTIONS,
@@ -147,7 +148,9 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
   // Teachers filtered according to schedule on active Hari (in Cuti mode, always allow picking any registered teacher/staff)
   const baseTeachersOnDay = useMemo(() => {
     if (inputMode === 'cuti' || showAllTeachers) return masterList;
-    return masterList.filter((m) => isTeacherWajibHadir(m, activeHari, jadwalList, settings?.guruTanpaJadwalWajibHadir));
+    return masterList.filter((m) =>
+      isTeacherWajibHadir(m, activeHari, jadwalList, settings?.guruTanpaJadwalWajibHadir, settings?.attendanceRuleOverrides)
+    );
   }, [masterList, activeHari, showAllTeachers, jadwalList, settings, inputMode]);
 
   const selectedPersonData = useMemo(() => {
@@ -156,8 +159,8 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
 
   const scheduleEvalResult = useMemo(() => {
     if (!selectedPersonData) return null;
-    return evaluateTeacherScheduleForDay(selectedPersonData, activeHari, threshold, jadwalList);
-  }, [selectedPersonData, activeHari, threshold, jadwalList]);
+    return evaluateTeacherScheduleForDay(selectedPersonData, activeHari, threshold, jadwalList, settings?.attendanceRuleOverrides);
+  }, [selectedPersonData, activeHari, threshold, jadwalList, settings?.attendanceRuleOverrides]);
 
   const mapelHariIni = useMemo(() => {
     if (!selectedPersonData || !scheduleEvalResult) return '-';
@@ -197,15 +200,19 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
         targetDates: [] as typeof rangeResult.schoolDates,
         conflictingDates: [] as LogPresensi[],
         finalSaveDates: [] as typeof rangeResult.schoolDates,
-        teacherPeran: selectedPersonData ? determineTeacherPeran(selectedPersonData, jadwalList) : 'Guru'
+        teacherPeran: selectedPersonData
+          ? determineTeacherPeran(selectedPersonData, jadwalList, undefined, settings?.attendanceRuleOverrides)
+          : 'Guru'
       };
     }
 
-    const teacherPeran = selectedPersonData ? determineTeacherPeran(selectedPersonData, jadwalList) : 'Guru';
+    const teacherPeran = selectedPersonData
+      ? determineTeacherPeran(selectedPersonData, jadwalList, undefined, settings?.attendanceRuleOverrides)
+      : 'Guru';
 
     const wajibDates = selectedPersonData
       ? rangeResult.schoolDates.filter((d) =>
-          isTeacherWajibHadir(selectedPersonData, d.hari, jadwalList, settings?.guruTanpaJadwalWajibHadir)
+          isTeacherWajibHadir(selectedPersonData, d.hari, jadwalList, settings?.guruTanpaJadwalWajibHadir, settings?.attendanceRuleOverrides)
         )
       : rangeResult.schoolDates;
 
@@ -321,7 +328,9 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
           settings?.kebijakanKehadiran || 'instruksi_kepala_sekolah',
           jadwalList,
           settings?.guruToleransiMenit || 0,
-          settings?.guruTanpaJadwalWajibHadir || false
+          settings?.guruTanpaJadwalWajibHadir || false,
+          undefined,
+          settings?.attendanceRuleOverrides
         )
       : { status: evaluateStatus24h(currentJam, threshold), isScheduleBased: false, thresholdUsed: threshold };
     const autoStatus = evalResult.status;
@@ -408,7 +417,9 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
         settings?.kebijakanKehadiran || 'instruksi_kepala_sekolah',
         jadwalList,
         settings?.guruToleransiMenit || 0,
-        settings?.guruTanpaJadwalWajibHadir || false
+        settings?.guruTanpaJadwalWajibHadir || false,
+        undefined,
+        settings?.attendanceRuleOverrides
       );
       peranVal = evalRes.peran;
       batasStafVal = evalRes.batasStaf || undefined;
@@ -444,7 +455,7 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
         waktuPengajuan: now.toISOString().replace('T', ' ').substring(0, 19),
         nama: selectedPersonData.nama,
         jabatan: selectedPersonData.jabatan,
-        peran: determineTeacherPeran(selectedPersonData, jadwalList),
+        peran: determineTeacherPeran(selectedPersonData, jadwalList, undefined, settings?.attendanceRuleOverrides),
         jenisCuti: selectedCutiPreset.label,
         tanggalMulai: selectedTanggal,
         tanggalSelesai: selectedTanggal,
@@ -513,11 +524,11 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
     });
 
     const nowTs = formatTimestamp();
-    const peranGuru = determineTeacherPeran(selectedPersonData, jadwalList);
+    const peranGuru = determineTeacherPeran(selectedPersonData, jadwalList, undefined, settings?.attendanceRuleOverrides);
 
     const logsToSave: LogPresensi[] = cutiPlan.finalSaveDates.map((d, idx) => {
       const existing = existingByDate.get(d.tanggal);
-      const schedEval = evaluateTeacherScheduleForDay(selectedPersonData, d.hari, threshold, jadwalList);
+      const schedEval = evaluateTeacherScheduleForDay(selectedPersonData, d.hari, threshold, jadwalList, settings?.attendanceRuleOverrides);
       const mapelOnDate = schedEval.hasTeachingSchedule
         ? schedEval.mapelHariIni
         : getMapelHariIni(selectedPersonData, d.hari, jadwalList);
@@ -757,7 +768,22 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
                     selectedStatus.includes('Alpa');
                   executeSave(isAbs ? '-' : customJam || '-', selectedStatus, keterangan);
                 } else {
-                  executeSave(formatTimeHHMM(), evaluateStatus24h(formatTimeHHMM(), threshold), keterangan);
+                  const jamNow = formatTimeHHMM();
+                  const stNow = selectedPersonData
+                    ? evaluateTeacherAttendanceStatus(
+                        jamNow,
+                        selectedPersonData,
+                        activeHari,
+                        threshold,
+                        settings?.kebijakanKehadiran || 'instruksi_kepala_sekolah',
+                        jadwalList,
+                        settings?.guruToleransiMenit || 0,
+                        settings?.guruTanpaJadwalWajibHadir || false,
+                        undefined,
+                        settings?.attendanceRuleOverrides
+                      ).status
+                    : evaluateStatus24h(jamNow, threshold);
+                  executeSave(jamNow, stNow, keterangan);
                 }
               }}
               className="px-4 py-2 rounded-xl text-xs sm:text-sm font-semibold text-white bg-amber-600 hover:bg-amber-700 shadow-sm"
@@ -891,7 +917,7 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
                 <span className="text-sm font-bold text-slate-800">{selectedPersonData.jabatan}</span>
               </div>
               <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-white border border-blue-200 text-[#2F5597] w-fit">
-                Peran: {determineTeacherPeran(selectedPersonData, jadwalList)}
+                Peran: {determineTeacherPeran(selectedPersonData, jadwalList, undefined, settings?.attendanceRuleOverrides)}
               </span>
             </div>
 
@@ -951,7 +977,25 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
               <span>Catat Jam Datang Sekarang ({formatTimeHHMM()})</span>
             </button>
             <p className="text-xs text-center text-slate-500">
-              Status otomatis: <span className="font-semibold text-emerald-700">Tepat Waktu</span> (sebelum {threshold}) atau <span className="font-semibold text-amber-700">Terlambat</span> (setelah {threshold}).
+              {selectedPersonData ? (() => {
+                const r = resolveTeacherAttendanceRule(selectedPersonData, jadwalList, undefined, settings?.attendanceRuleOverrides);
+                if (r.ruleMode === 'sesuai_jadwal' && scheduleEvalResult?.firstScheduleTime) {
+                  return (
+                    <>
+                      Batas guru ({r.peran}) sesuai jadwal hari {activeHari}: <strong className="text-slate-800">{scheduleEvalResult.firstScheduleTime} WIB</strong> (Toleransi {settings?.guruToleransiMenit || 0} mnt).
+                    </>
+                  );
+                }
+                return (
+                  <>
+                    Batas wajib hadir ({r.peran}): <strong className="text-slate-800">{threshold} WIB</strong>.
+                  </>
+                );
+              })() : (
+                <>
+                  Status otomatis: <span className="font-semibold text-emerald-700">Tepat Waktu</span> atau <span className="font-semibold text-amber-700">Terlambat</span> sesuai jadwal &amp; peran masing-masing.
+                </>
+              )}
             </p>
           </div>
         )}
@@ -972,7 +1016,20 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
                   onChange={(formatted, isValid) => {
                     setCustomJam(formatted);
                     if (isValid && formatted) {
-                      const autoStatus = evaluateStatus24h(formatted, threshold);
+                      const autoStatus = selectedPersonData
+                        ? evaluateTeacherAttendanceStatus(
+                            formatted,
+                            selectedPersonData,
+                            activeHari,
+                            threshold,
+                            settings?.kebijakanKehadiran || 'instruksi_kepala_sekolah',
+                            jadwalList,
+                            settings?.guruToleransiMenit || 0,
+                            settings?.guruTanpaJadwalWajibHadir || false,
+                            undefined,
+                            settings?.attendanceRuleOverrides
+                          ).status
+                        : evaluateStatus24h(formatted, threshold);
                       setSelectedStatus(autoStatus);
                     }
                   }}
@@ -993,7 +1050,7 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
                   onChange={(e) => {
                     const nextSt = e.target.value as StatusPresensi;
                     setSelectedStatus(nextSt);
-                    if (['Cuti', 'Izin', 'Sakit', 'Dinas Luar', 'Alpa', 'Alpa (Jadwal Mengajar)', 'Alpa (Wajib Hadir Staf)'].includes(nextSt)) {
+                    if (['Cuti', 'Izin', 'Sakit', 'Dinas Luar', 'Alpa', 'Alpa (Jadwal Mengajar)', 'Alpa (Wajib Hadir Staf)', 'Alpa (Wajib Hadir Guru BK)'].includes(nextSt)) {
                       setCustomJam('');
                     }
                   }}
@@ -1007,6 +1064,7 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
                   <option value="Dinas Luar">Dinas Luar</option>
                   <option value="Alpa (Jadwal Mengajar)">Alpa (Jadwal Mengajar - Guru)</option>
                   <option value="Alpa (Wajib Hadir Staf)">Alpa (Wajib Hadir Staf/Struktural)</option>
+                  <option value="Alpa (Wajib Hadir Guru BK)">Alpa (Wajib Hadir Guru BK)</option>
                   <option value="Alpa">Alpa (Umum)</option>
                 </select>
               </div>
@@ -1451,14 +1509,27 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
                   l.tanggal <= rec.tanggalSelesai
               );
             }) && (
-              <div className="p-3.5 bg-sky-50 border border-sky-200 rounded-xl flex items-start gap-2.5 text-xs text-sky-900">
-                <Info className="w-4 h-4 text-sky-600 shrink-0 mt-0.5" />
-                <div>
-                  <span className="font-bold block">Ada catatan cuti di Data_Cuti yang belum memiliki baris harian di Log_Presensi</span>
-                  <span className="text-[11px] text-sky-800 block mt-0.5">
-                    Klik tombol <strong>Sinkronkan Data_Cuti &amp; Log_Presensi</strong> di atas untuk otomatis membuatkan catatan harian berstatus <strong>Cuti</strong> ke sheet <code className="font-mono font-bold">Log_Presensi</code>.
-                  </span>
+              <div className="p-3.5 bg-sky-50 border border-sky-200 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-sky-900">
+                <div className="flex items-start gap-2.5">
+                  <Info className="w-4 h-4 text-sky-600 shrink-0 mt-0.5" />
+                  <div>
+                    <span className="font-bold block">Ada catatan cuti di Data_Cuti yang belum memiliki baris harian di Log_Presensi</span>
+                    <span className="text-[11px] text-sky-800 block mt-0.5">
+                      Anda <strong>tidak perlu menginput ulang</strong> data guru yang cuti. Klik tombol di samping untuk otomatis mengisi baris harian berstatus <strong>Cuti</strong> ke sheet <code className="font-mono font-bold">Log_Presensi</code>.
+                    </span>
+                  </div>
                 </div>
+                {onSyncAllCuti && (
+                  <button
+                    type="button"
+                    onClick={handleSyncAllCutiClick}
+                    disabled={isSyncingCuti}
+                    className="inline-flex items-center justify-center gap-1.5 px-3 py-2 bg-sky-600 hover:bg-sky-700 text-white font-bold rounded-lg text-[11px] shrink-0 transition disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isSyncingCuti ? 'animate-spin' : ''}`} />
+                    <span>{isSyncingCuti ? 'Mengisi Log_Presensi...' : 'Isi ke Log_Presensi Sekarang'}</span>
+                  </button>
+                )}
               </div>
             )}
 

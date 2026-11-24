@@ -1,4 +1,4 @@
-import { AppSettings, DataCutiRecord, JadwalSlot, LogPresensi, MasterGuruStaf, StatusPresensi, TestApiResponse } from '../types';
+import { AppSettings, AttendanceRuleMode, DataCutiRecord, JadwalSlot, LogPresensi, MasterGuruStaf, StatusPresensi, TestApiResponse } from '../types';
 import { DEFAULT_MASTER_GURU_STAF } from '../data/defaultMaster';
 import { parseAndFormat24hTime } from './timeUtils';
 import { DEFAULT_SCHOOL_COORDS, normalizeCoordinate } from './qrAndGeoUtils';
@@ -143,7 +143,18 @@ function doPost(e) {
 
         var rows = logSheet.getDataRange().getValues();
         var keyMap = {};
+        var lastContentRow = 1;
         for (var i = 1; i < rows.length; i++) {
+          var rowHasContent = false;
+          for (var c = 0; c < rows[i].length; c++) {
+            if (rows[i][c] !== '' && rows[i][c] !== null && rows[i][c] !== undefined) {
+              rowHasContent = true;
+              break;
+            }
+          }
+          if (rowHasContent) {
+            lastContentRow = i + 1;
+          }
           var rNama = String(rows[i][4] || '').trim().toLowerCase();
           var rTanggal = formatDate(rows[i][2]).trim();
           if (rNama && rTanggal) {
@@ -197,7 +208,7 @@ function doPost(e) {
         }
 
         if (appendBatch.length > 0) {
-          var startAppendRow = Math.max(logSheet.getLastRow(), 1) + 1;
+          var startAppendRow = Math.max(lastContentRow, 1) + 1;
           logSheet.getRange(startAppendRow, 1, appendBatch.length, 15).setValues(appendBatch);
         }
 
@@ -588,7 +599,9 @@ function doPost(e) {
         var key = keys[s];
         // Jangan pernah simpan webAppUrl atau adminPin ke Sheets
         if (key !== 'webAppUrl' && key !== 'adminPin') {
-          var val = String(newSettings[key]);
+          var rawVal = newSettings[key];
+          if (rawVal === undefined || rawVal === null) continue;
+          var val = (typeof rawVal === 'object') ? JSON.stringify(rawVal) : String(rawVal);
           // koordinat disimpan sebagai teks agar tidak rusak oleh locale Indonesia
           if (key === 'jamMasukThreshold' || key === 'schoolLatitude' || key === 'schoolLongitude') {
             settingsSheet.appendRow([key, "'" + val]);
@@ -963,6 +976,62 @@ function backfillCutiFromLogs(ss, cutiSheet) {
   return rowsToInsert.length;
 }
 
+function ensureStatusDropdownValidation(sheet, statusCol) {
+  if (!sheet) return;
+  var col = statusCol || 9;
+  var defaultStatuses = [
+    'Tepat Waktu',
+    'Terlambat',
+    'Izin',
+    'Sakit',
+    'Cuti',
+    'Dinas Luar',
+    'Alpa',
+    'Alpa (Jadwal Mengajar)',
+    'Alpa (Wajib Hadir Staf)',
+    'Alpa (Wajib Hadir Guru BK)'
+  ];
+  var maxDataRow = Math.max(sheet.getMaxRows(), 500);
+  var sampleCell = sheet.getRange(2, col, 1, 1);
+  var existingRule = sampleCell.getDataValidation();
+  if (existingRule && existingRule.getCriteriaType() === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) {
+    var args = existingRule.getCriteriaValues();
+    var existingList = Array.isArray(args[0]) ? args[0] : [];
+    var hasCuti = existingList.some(function(v) { return String(v).trim().toLowerCase() === 'cuti'; });
+    var hasBkAlpa = existingList.some(function(v) { return String(v).trim().toLowerCase() === 'alpa (wajib hadir guru bk)'; });
+    if (hasCuti && hasBkAlpa && existingRule.getAllowInvalid()) {
+      return;
+    }
+    var merged = [];
+    var seen = {};
+    for (var i = 0; i < existingList.length; i++) {
+      var item = String(existingList[i] || '').trim();
+      if (item && !seen[item.toLowerCase()]) {
+        seen[item.toLowerCase()] = true;
+        merged.push(item);
+      }
+    }
+    for (var j = 0; j < defaultStatuses.length; j++) {
+      var def = defaultStatuses[j];
+      if (!seen[def.toLowerCase()]) {
+        seen[def.toLowerCase()] = true;
+        merged.push(def);
+      }
+    }
+    var updatedRule = SpreadsheetApp.newDataValidation()
+      .requireValueInList(merged, true)
+      .setAllowInvalid(true)
+      .build();
+    sheet.getRange(2, col, maxDataRow - 1, 1).setDataValidation(updatedRule);
+  } else if (!existingRule) {
+    var newRule = SpreadsheetApp.newDataValidation()
+      .requireValueInList(defaultStatuses, true)
+      .setAllowInvalid(true)
+      .build();
+    sheet.getRange(2, col, maxDataRow - 1, 1).setDataValidation(newRule);
+  }
+}
+
 function ensureLogHeaders(sheet) {
   if (!sheet) return;
   if (sheet.getLastRow() === 0) {
@@ -971,6 +1040,7 @@ function ensureLogHeaders(sheet) {
       'Jabatan', 'Mapel Diampu Hari Ini', 'Jam Datang', 'Status', 'Keterangan',
       'Peran', 'Batas Staf', 'Status Staf', 'Batas Mengajar', 'Status Mengajar'
     ]);
+    ensureStatusDropdownValidation(sheet, 9);
     return;
   }
   var lastCol = sheet.getLastColumn();
@@ -983,6 +1053,15 @@ function ensureLogHeaders(sheet) {
       sheet.getRange(1, colIdx + 1).setValue(newHeaders[c]);
     }
   }
+  var statusCol1Based = 9;
+  for (var hc = 0; hc < headerValues.length; hc++) {
+    var hText = String(headerValues[hc] || '').toLowerCase().trim();
+    if (hText.indexOf('status') > -1 && hText.indexOf('staf') === -1 && hText.indexOf('ajar') === -1) {
+      statusCol1Based = hc + 1;
+      break;
+    }
+  }
+  ensureStatusDropdownValidation(sheet, statusCol1Based);
 }
 
 function checkPin(pin) {
@@ -1442,6 +1521,7 @@ const STORAGE_KEY_REQ_DEVICE_LOCK = 'smp_nurul_abror_req_device_lock';
 const STORAGE_KEY_KEBIJAKAN = 'smp_nurul_abror_kebijakan_kehadiran';
 export const STORAGE_KEY_JADWAL_TAHUN = 'smp_nurul_abror_jadwal_tahun_ajaran';
 export const STORAGE_KEY_JADWAL_SEMESTER = 'smp_nurul_abror_jadwal_semester';
+const STORAGE_KEY_ATTENDANCE_OVERRIDES = 'smp_nurul_abror_attendance_rule_overrides_v1';
 
 export const MASTER_SCHEMA_VERSION_KEY = 'smp_nurul_abror_master_schema_v3';
 export const CURRENT_MASTER_SCHEMA_VERSION = 'v2026_10_12_jadwal_fiqih_zaini_v8_permanent';
@@ -1553,11 +1633,8 @@ export function normalizeMasterGuruStaf(rawList: MasterGuruStaf[]): MasterGuruSt
       }
     }
 
-    if (!copy.peran) {
-      const jab = (copy.jabatan || '').toLowerCase();
-      const isGuru = jab.includes('guru');
-      copy.peran = isGuru ? 'Guru' : 'Staf';
-    }
+    // Biarkan peran kosong agar evaluator cerdas (determineTeacherPeran / resolveTeacherAttendanceRule)
+    // dapat membedakan Guru, Guru BK, Guru+Staf, dan Staf secara akurat sesuai jadwal & jabatan.
 
     result.push(copy);
   }
@@ -1603,6 +1680,22 @@ export function getStoredSettings(): AppSettings {
   const requireDeviceLock = localStorage.getItem(STORAGE_KEY_REQ_DEVICE_LOCK) !== 'false';
   const jadwalTahunAjaran = localStorage.getItem(STORAGE_KEY_JADWAL_TAHUN) || undefined;
   const jadwalSemester = localStorage.getItem(STORAGE_KEY_JADWAL_SEMESTER) || undefined;
+  let attendanceRuleOverrides: Record<string, AttendanceRuleMode> = {};
+  try {
+    const rawOverrides = localStorage.getItem(STORAGE_KEY_ATTENDANCE_OVERRIDES);
+    if (rawOverrides) {
+      const parsedOverrides = JSON.parse(rawOverrides);
+      if (parsedOverrides && typeof parsedOverrides === 'object' && !Array.isArray(parsedOverrides)) {
+        for (const [k, v] of Object.entries(parsedOverrides)) {
+          if (v === 'sesuai_jadwal' || v === 'wajib_harian' || v === 'ganda') {
+            attendanceRuleOverrides[k] = v;
+          }
+        }
+      }
+    }
+  } catch (e) {
+    attendanceRuleOverrides = {};
+  }
 
   return {
     webAppUrl,
@@ -1624,7 +1717,8 @@ export function getStoredSettings(): AppSettings {
     requireLocation,
     requireDeviceLock,
     jadwalTahunAjaran,
-    jadwalSemester
+    jadwalSemester,
+    attendanceRuleOverrides
   };
 }
 
@@ -1649,6 +1743,9 @@ export function saveStoredSettings(settings: Partial<AppSettings>) {
   if (settings.requireDeviceLock !== undefined) localStorage.setItem(STORAGE_KEY_REQ_DEVICE_LOCK, String(settings.requireDeviceLock));
   if (settings.jadwalTahunAjaran !== undefined) localStorage.setItem(STORAGE_KEY_JADWAL_TAHUN, settings.jadwalTahunAjaran.trim());
   if (settings.jadwalSemester !== undefined) localStorage.setItem(STORAGE_KEY_JADWAL_SEMESTER, settings.jadwalSemester.trim());
+  if (settings.attendanceRuleOverrides !== undefined) {
+    localStorage.setItem(STORAGE_KEY_ATTENDANCE_OVERRIDES, JSON.stringify(settings.attendanceRuleOverrides || {}));
+  }
 }
 
 export function resetMasterDataToOfficial(): MasterGuruStaf[] {
@@ -1694,6 +1791,7 @@ function normalizeStatus(statusRaw: string): StatusPresensi {
   if (s === 'cuti' || s.startsWith('cuti')) return 'Cuti';
   if (s === 'alpa (jadwal mengajar)') return 'Alpa (Jadwal Mengajar)';
   if (s === 'alpa (wajib hadir staf)') return 'Alpa (Wajib Hadir Staf)';
+  if (s === 'alpa (wajib hadir guru bk)') return 'Alpa (Wajib Hadir Guru BK)';
   if (s === 'alpa' || s === 'alpha' || s === 'tanpa keterangan') return 'Alpa';
   if (s === 'dinas luar' || s === 'dinas') return 'Dinas Luar';
   return 'Tepat Waktu';
@@ -1793,6 +1891,24 @@ function parseRemoteSettings(raw: Record<string, any>): Partial<AppSettings> {
   if (raw.requireDeviceLock !== undefined) result.requireDeviceLock = raw.requireDeviceLock === true || raw.requireDeviceLock === 'true';
   if (raw.jadwalTahunAjaran) result.jadwalTahunAjaran = String(raw.jadwalTahunAjaran).trim();
   if (raw.jadwalSemester) result.jadwalSemester = String(raw.jadwalSemester).trim();
+  if (raw.attendanceRuleOverrides !== undefined) {
+    try {
+      const parsed = typeof raw.attendanceRuleOverrides === 'string'
+        ? JSON.parse(raw.attendanceRuleOverrides)
+        : raw.attendanceRuleOverrides;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const cleanMap: Record<string, AttendanceRuleMode> = {};
+        for (const [k, v] of Object.entries(parsed)) {
+          if (v === 'sesuai_jadwal' || v === 'wajib_harian' || v === 'ganda') {
+            cleanMap[k] = v;
+          }
+        }
+        result.attendanceRuleOverrides = cleanMap;
+      }
+    } catch (e) {
+      // ignore invalid remote JSON
+    }
+  }
   return result;
 }
 

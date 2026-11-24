@@ -1,4 +1,4 @@
-import { DataCutiRecord, HariSekolah, JadwalSlot, LogPresensi, MasterGuruStaf } from '../types';
+import { AttendanceRuleMode, DataCutiRecord, HariSekolah, JadwalSlot, LogPresensi, MasterGuruStaf } from '../types';
 import { getHariFromDate, isJumat, formatLongDateIndonesian, formatTimestamp, getMapelHariIni } from './dateUtils';
 import { determineTeacherPeran, evaluateTeacherScheduleForDay, isTeacherWajibHadir } from './scheduleTimeEvaluator';
 
@@ -227,14 +227,19 @@ export function buildMissingDailyCutiLogs(params: {
   threshold: string;
   jadwalList?: JadwalSlot[];
   guruTanpaJadwalWajibHadir?: boolean;
+  attendanceRuleOverrides?: Record<string, AttendanceRuleMode>;
 }): LogPresensi[] {
-  const { cutiRecords, existingLogs, masterList, threshold, jadwalList, guruTanpaJadwalWajibHadir } = params;
+  const { cutiRecords, existingLogs, masterList, threshold, jadwalList, guruTanpaJadwalWajibHadir, attendanceRuleOverrides } = params;
   if (!cutiRecords || cutiRecords.length === 0) return [];
 
   const existingKeys = new Set<string>();
   for (const l of existingLogs) {
     if (!l.nama || !l.tanggal) continue;
-    existingKeys.add(`${l.nama.trim().toLowerCase()}|${l.tanggal.trim()}`);
+    const hasRealClockIn = Boolean(l.jamDatang && l.jamDatang !== '-');
+    const isBlankDefaultedRow = !hasRealClockIn && l.status === 'Tepat Waktu' && !(l.keterangan || '').trim();
+    if (!isBlankDefaultedRow) {
+      existingKeys.add(`${l.nama.trim().toLowerCase()}|${l.tanggal.trim()}`);
+    }
   }
 
   const masterByName = new Map<string, MasterGuruStaf>();
@@ -261,7 +266,7 @@ export function buildMissingDailyCutiLogs(params: {
     let targetDates = range.schoolDates;
     if (rec.cakupan === 'wajib_hadir' && teacher) {
       const wajibOnly = range.schoolDates.filter((d) =>
-        isTeacherWajibHadir(teacher, d.hari, jadwalList, guruTanpaJadwalWajibHadir)
+        isTeacherWajibHadir(teacher, d.hari, jadwalList, guruTanpaJadwalWajibHadir, attendanceRuleOverrides)
       );
       if (wajibOnly.length > 0) {
         targetDates = wajibOnly;
@@ -271,7 +276,7 @@ export function buildMissingDailyCutiLogs(params: {
     const peranGuru = rec.peran && rec.peran !== '-'
       ? rec.peran
       : teacher
-      ? determineTeacherPeran(teacher, jadwalList)
+      ? determineTeacherPeran(teacher, jadwalList, undefined, attendanceRuleOverrides)
       : 'Guru';
 
     const keterangan = formatCutiKeterangan({
@@ -291,7 +296,7 @@ export function buildMissingDailyCutiLogs(params: {
 
       let mapelOnDate = '-';
       if (teacher) {
-        const schedEval = evaluateTeacherScheduleForDay(teacher, d.hari, threshold, jadwalList);
+        const schedEval = evaluateTeacherScheduleForDay(teacher, d.hari, threshold, jadwalList, attendanceRuleOverrides);
         mapelOnDate = schedEval.hasTeachingSchedule
           ? schedEval.mapelHariIni
           : getMapelHariIni(teacher, d.hari, jadwalList);

@@ -1,5 +1,6 @@
 import React, { useState, useMemo } from 'react';
-import { LogPresensi, StatusPresensi, MasterGuruStaf } from '../types';
+import { AppSettings, JadwalSlot, LogPresensi, StatusPresensi, MasterGuruStaf } from '../types';
+import { determineTeacherPeran } from '../utils/scheduleTimeEvaluator';
 import {
   formatDateISO,
   formatLongDateIndonesian,
@@ -35,6 +36,8 @@ interface RekapRiwayatProps {
   onRefresh: () => void;
   onDeleteLog: (id: string) => Promise<void>;
   isRefreshing: boolean;
+  settings?: AppSettings;
+  jadwalList?: JadwalSlot[];
 }
 
 export type PeriodType = 'harian' | 'minggu_ini' | 'bulan_ini' | 'bulan_lalu' | 'custom' | 'semua';
@@ -47,7 +50,9 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
   sheetUrl,
   onRefresh,
   onDeleteLog,
-  isRefreshing
+  isRefreshing,
+  settings,
+  jadwalList
 }) => {
   // Period filter states
   const [periodType, setPeriodType] = useState<PeriodType>('harian');
@@ -205,7 +210,7 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
         map.set(key, {
           nama: m.nama.trim(),
           jabatan: m.jabatan || '-',
-          peran: m.peran || (m.jabatan.toLowerCase().includes('guru') ? 'Guru' : 'Staf'),
+          peran: determineTeacherPeran(m, jadwalList, undefined, settings?.attendanceRuleOverrides),
           hadirDates: new Set<string>(),
           cutiDates: new Set<string>(),
           problemDates: new Set<string>(),
@@ -272,8 +277,8 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
         hasProblemOnThisLog = true;
       }
 
-      // 4. Alpa (Wajib Hadir Staf)
-      if (l.status === 'Alpa (Wajib Hadir Staf)') {
+      // 4. Alpa (Wajib Hadir Staf / Guru BK)
+      if (l.status === 'Alpa (Wajib Hadir Staf)' || l.status === 'Alpa (Wajib Hadir Guru BK)') {
         item.alpaStaf++;
         hasProblemOnThisLog = true;
       }
@@ -285,7 +290,13 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
       }
 
       // 6. Alpa Umum
-      if (l.status === 'Alpa' || (l.status.includes('Alpa') && l.status !== 'Alpa (Wajib Hadir Staf)' && l.status !== 'Alpa (Jadwal Mengajar)')) {
+      if (
+        l.status === 'Alpa' ||
+        (l.status.includes('Alpa') &&
+          l.status !== 'Alpa (Wajib Hadir Staf)' &&
+          l.status !== 'Alpa (Wajib Hadir Guru BK)' &&
+          l.status !== 'Alpa (Jadwal Mengajar)')
+      ) {
         item.alpaUmum++;
         hasProblemOnThisLog = true;
       }
@@ -315,7 +326,7 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
     // Urutkan dari Total Hari Bermasalah terbanyak, lalu nama
     rows.sort((a, b) => b.totalHariBermasalah - a.totalHariBermasalah || b.hariHadir - a.hariHadir || a.nama.localeCompare(b.nama));
     return rows;
-  }, [masterList, periodLogs]);
+  }, [masterList, periodLogs, jadwalList, settings?.attendanceRuleOverrides]);
 
   const hasLegacyLates = useMemo(() => {
     return pelanggaranReport.some((r) => r.terlambatLegacy > 0);
@@ -384,7 +395,7 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
       } else if (l.status === 'Cuti') {
         item.cutiDetails.push(`${formatLongDateIndonesian(l.tanggal)}${l.keterangan ? ` (${l.keterangan})` : ''}`);
       } else if (l.status === 'Alpa (Jadwal Mengajar)') item.alpaMengajar++;
-      else if (l.status === 'Alpa (Wajib Hadir Staf)') item.alpaStaf++;
+      else if (l.status === 'Alpa (Wajib Hadir Staf)' || l.status === 'Alpa (Wajib Hadir Guru BK)') item.alpaStaf++;
       else if (l.status.includes('Alpa')) item.alpaUmum++;
       else if (l.status === 'Dinas Luar') {
         item.dinasDetails.push(`${formatLongDateIndonesian(l.tanggal)}${l.keterangan ? ` (${l.keterangan})` : ''}`);
@@ -430,6 +441,7 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
       case 'Alpa':
       case 'Alpa (Jadwal Mengajar)':
       case 'Alpa (Wajib Hadir Staf)':
+      case 'Alpa (Wajib Hadir Guru BK)':
         return (
           <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-bold bg-rose-100 text-rose-800 border border-rose-300">
             <XCircle className="w-3.5 h-3.5 text-rose-600" />
@@ -927,6 +939,7 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
                   <option value="Dinas Luar">Dinas Luar</option>
                   <option value="Alpa (Jadwal Mengajar)">Alpa (Jadwal Mengajar)</option>
                   <option value="Alpa (Wajib Hadir Staf)">Alpa (Wajib Hadir Staf)</option>
+                  <option value="Alpa (Wajib Hadir Guru BK)">Alpa (Wajib Hadir Guru BK)</option>
                   <option value="Alpa">Alpa (Umum)</option>
                 </select>
               </div>
@@ -1010,6 +1023,10 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
                                 <span className={`inline-block mt-0.5 px-1.5 py-0.2 rounded text-[10px] font-semibold border ${
                                   log.peran === 'Guru'
                                     ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                                    : log.peran === 'Guru BK'
+                                    ? 'bg-teal-50 text-teal-800 border-teal-200'
+                                    : log.peran === 'Guru BK+Mengajar'
+                                    ? 'bg-purple-50 text-purple-800 border-purple-200'
                                     : log.peran === 'Guru+Staf'
                                     ? 'bg-amber-50 text-amber-800 border-amber-200'
                                     : 'bg-slate-100 text-slate-600 border-slate-200'
@@ -1371,7 +1388,7 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
                           </th>
                         )}
                         <th className="px-3 py-3 text-center text-rose-900 bg-rose-50/50">
-                          Alpa (Wajib Hadir Staf)
+                          Alpa (Wajib Harian Staf/BK)
                         </th>
                         <th className="px-3 py-3 text-center text-red-900 bg-red-50/50">
                           Alpa (Jadwal Mengajar)
@@ -1402,6 +1419,10 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
                               <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
                                 row.peran === 'Guru'
                                   ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                                  : row.peran === 'Guru BK'
+                                  ? 'bg-teal-50 text-teal-800 border-teal-200'
+                                  : row.peran === 'Guru BK+Mengajar'
+                                  ? 'bg-purple-50 text-purple-800 border-purple-200'
                                   : row.peran === 'Guru+Staf'
                                   ? 'bg-amber-50 text-amber-800 border-amber-200'
                                   : 'bg-slate-100 text-slate-700 border-slate-200'

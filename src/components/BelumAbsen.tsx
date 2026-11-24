@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { MasterGuruStaf, LogPresensi, AppSettings, JadwalSlot } from '../types';
 import { formatDateISO, getHariFromDate, formatLongDateIndonesian, isJumat } from '../utils/dateUtils';
-import { evaluateTeacherScheduleForDay, isTeacherWajibHadir, determineTeacherPeran } from '../utils/scheduleTimeEvaluator';
+import { evaluateTeacherScheduleForDay, isTeacherWajibHadir, determineTeacherPeran, getDefaultAlpaStatus } from '../utils/scheduleTimeEvaluator';
 import { UserX, Search, Calendar, UserCheck, ArrowRight, AlertTriangle, BookOpen, Briefcase, CalendarRange } from 'lucide-react';
 
 interface BelumAbsenProps {
@@ -49,8 +49,8 @@ export const BelumAbsen: React.FC<BelumAbsenProps> = ({
 
       if (showAllUnscheduled) return true;
 
-      // Staf & Guru+Staf selalu wajib hadir; Guru hanya bila punya sesi mengajar hari itu (atau guruTanpaJadwalWajibHadir = true)
-      return isTeacherWajibHadir(m, activeHari, jadwalList, settings?.guruTanpaJadwalWajibHadir);
+      // Staf, Guru BK & Ganda selalu wajib hadir; Guru hanya bila punya sesi mengajar hari itu (atau guruTanpaJadwalWajibHadir = true)
+      return isTeacherWajibHadir(m, activeHari, jadwalList, settings?.guruTanpaJadwalWajibHadir, settings?.attendanceRuleOverrides);
     });
   }, [masterList, logs, selectedTanggal, activeHari, showAllUnscheduled, jadwalList, settings]);
 
@@ -180,9 +180,9 @@ export const BelumAbsen: React.FC<BelumAbsenProps> = ({
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           {filteredUnmarked.map((guru, idx) => {
-            const peran = determineTeacherPeran(guru, jadwalList);
-            const alpaStatus = peran === 'Guru' ? 'Alpa (Jadwal Mengajar)' : 'Alpa (Wajib Hadir Staf)';
-            const scheduleEval = evaluateTeacherScheduleForDay(guru, activeHari, settings?.jamMasukThreshold || '07:25', jadwalList);
+            const peran = determineTeacherPeran(guru, jadwalList, undefined, settings?.attendanceRuleOverrides);
+            const alpaStatus = getDefaultAlpaStatus(guru, jadwalList, settings?.attendanceRuleOverrides);
+            const scheduleEval = evaluateTeacherScheduleForDay(guru, activeHari, settings?.jamMasukThreshold || '07:25', jadwalList, settings?.attendanceRuleOverrides);
             return (
               <div
                 key={`belum-absen-${guru.no}-${guru.nama}-${idx}`}
@@ -196,6 +196,10 @@ export const BelumAbsen: React.FC<BelumAbsenProps> = ({
                         <span className={`px-2 py-0.2 rounded text-[9.5px] font-black border ${
                           peran === 'Guru'
                             ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                            : peran === 'Guru BK'
+                            ? 'bg-teal-50 text-teal-800 border-teal-200'
+                            : peran === 'Guru BK+Mengajar'
+                            ? 'bg-purple-50 text-purple-800 border-purple-200'
                             : peran === 'Guru+Staf'
                             ? 'bg-amber-50 text-amber-800 border-amber-200'
                             : 'bg-slate-100 text-slate-700 border-slate-300'

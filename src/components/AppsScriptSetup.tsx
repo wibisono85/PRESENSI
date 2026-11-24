@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { APPS_SCRIPT_CODE } from '../utils/googleAppsScript';
 import { DEFAULT_SCHOOL_COORDS } from '../utils/qrAndGeoUtils';
-import { AppSettings, MasterGuruStaf } from '../types';
+import { resolveTeacherAttendanceRule } from '../utils/scheduleTimeEvaluator';
+import { AppSettings, AttendanceRuleMode, JadwalSlot, MasterGuruStaf } from '../types';
 import {
   Settings,
   Link as LinkIcon,
@@ -19,7 +20,10 @@ import {
   MapPin,
   Sliders,
   ShieldCheck,
-  Lock
+  Lock,
+  Users,
+  Search,
+  RotateCcw
 } from 'lucide-react';
 
 interface AppsScriptSetupProps {
@@ -28,6 +32,8 @@ interface AppsScriptSetupProps {
   onTestConnection: () => Promise<void>;
   onSeedMasterData: () => Promise<{ success: boolean; message: string }>;
   masterCount: number;
+  masterList?: MasterGuruStaf[];
+  jadwalList?: JadwalSlot[];
 }
 
 export const AppsScriptSetup: React.FC<AppsScriptSetupProps> = ({
@@ -35,13 +41,24 @@ export const AppsScriptSetup: React.FC<AppsScriptSetupProps> = ({
   onSaveSettings,
   onTestConnection,
   onSeedMasterData,
-  masterCount
+  masterCount,
+  masterList = [],
+  jadwalList
 }) => {
   const [webAppUrl, setWebAppUrl] = useState<string>(settings.webAppUrl);
   const [sheetUrl, setSheetUrl] = useState<string>(settings.sheetUrl);
   const [threshold, setThreshold] = useState<string>(settings.jamMasukThreshold || '07:25');
   const [guruToleransiMenit, setGuruToleransiMenit] = useState<number>(settings.guruToleransiMenit ?? 0);
   const [guruTanpaJadwalWajibHadir, setGuruTanpaJadwalWajibHadir] = useState<boolean>(settings.guruTanpaJadwalWajibHadir ?? false);
+  const [attendanceRuleOverrides, setAttendanceRuleOverrides] = useState<Record<string, AttendanceRuleMode>>(
+    settings.attendanceRuleOverrides || {}
+  );
+  const [ruleSearch, setRuleSearch] = useState<string>('');
+  const [ruleFilter, setRuleFilter] = useState<'semua' | 'wajib_harian' | 'sesuai_jadwal' | 'ganda' | 'guru_bk'>('semua');
+
+  useEffect(() => {
+    setAttendanceRuleOverrides(settings.attendanceRuleOverrides || {});
+  }, [settings.attendanceRuleOverrides]);
 
   // School GPS Location state
   const [schoolLatitude, setSchoolLatitude] = useState<string>(
@@ -116,6 +133,7 @@ export const AppsScriptSetup: React.FC<AppsScriptSetupProps> = ({
         jamMasukThreshold: threshold.trim(),
         guruToleransiMenit: Number(guruToleransiMenit) || 0,
         guruTanpaJadwalWajibHadir: Boolean(guruTanpaJadwalWajibHadir),
+        attendanceRuleOverrides,
         schoolLatitude: lat,
         schoolLongitude: lng,
         schoolRadiusMeters,
@@ -161,6 +179,80 @@ export const AppsScriptSetup: React.FC<AppsScriptSetupProps> = ({
     const res = await onSeedMasterData();
     setSeedResult(res);
     setIsSeeding(false);
+  };
+
+  const ruleRows = useMemo(() => {
+    return masterList.map((m) => {
+      const autoRule = resolveTeacherAttendanceRule(m, jadwalList, undefined, undefined);
+      const effectiveRule = resolveTeacherAttendanceRule(m, jadwalList, undefined, attendanceRuleOverrides);
+      const normKey = m.nama.trim().toLowerCase();
+      let selectedOverride: AttendanceRuleMode | '' = '';
+      if (attendanceRuleOverrides[normKey]) {
+        selectedOverride = attendanceRuleOverrides[normKey];
+      } else {
+        for (const [k, v] of Object.entries(attendanceRuleOverrides) as [string, AttendanceRuleMode][]) {
+          if (k.trim().toLowerCase() === normKey) {
+            selectedOverride = v;
+            break;
+          }
+        }
+      }
+      return {
+        teacher: m,
+        normKey,
+        autoRule,
+        effectiveRule,
+        selectedOverride
+      };
+    });
+  }, [masterList, jadwalList, attendanceRuleOverrides]);
+
+  const ruleCounts = useMemo(() => {
+    let wajibHarian = 0;
+    let sesuaiJadwal = 0;
+    let ganda = 0;
+    let guruBk = 0;
+    for (const r of ruleRows) {
+      if (r.effectiveRule.ruleMode === 'wajib_harian') wajibHarian++;
+      else if (r.effectiveRule.ruleMode === 'sesuai_jadwal') sesuaiJadwal++;
+      else if (r.effectiveRule.ruleMode === 'ganda') ganda++;
+      if (r.effectiveRule.isGuruBk) guruBk++;
+    }
+    return { wajibHarian, sesuaiJadwal, ganda, guruBk };
+  }, [ruleRows]);
+
+  const filteredRuleRows = useMemo(() => {
+    return ruleRows.filter((r) => {
+      if (ruleFilter === 'wajib_harian' && r.effectiveRule.ruleMode !== 'wajib_harian') return false;
+      if (ruleFilter === 'sesuai_jadwal' && r.effectiveRule.ruleMode !== 'sesuai_jadwal') return false;
+      if (ruleFilter === 'ganda' && r.effectiveRule.ruleMode !== 'ganda') return false;
+      if (ruleFilter === 'guru_bk' && !r.effectiveRule.isGuruBk) return false;
+      if (ruleSearch.trim()) {
+        const q = ruleSearch.trim().toLowerCase();
+        return (
+          r.teacher.nama.toLowerCase().includes(q) ||
+          r.teacher.jabatan.toLowerCase().includes(q) ||
+          r.effectiveRule.peran.toLowerCase().includes(q)
+        );
+      }
+      return true;
+    });
+  }, [ruleRows, ruleFilter, ruleSearch]);
+
+  const handleOverrideChange = (teacherName: string, mode: AttendanceRuleMode | '') => {
+    const key = teacherName.trim().toLowerCase();
+    setAttendanceRuleOverrides((prev) => {
+      const next: Record<string, AttendanceRuleMode> = {};
+      for (const [k, v] of Object.entries(prev) as [string, AttendanceRuleMode][]) {
+        if (k.trim().toLowerCase() !== key) {
+          next[k] = v;
+        }
+      }
+      if (mode) {
+        next[key] = mode;
+      }
+      return next;
+    });
   };
 
   return (
@@ -297,6 +389,171 @@ export const AppsScriptSetup: React.FC<AppsScriptSetupProps> = ({
               </div>
             </div>
           </div>
+
+          {/* Pengaturan Wajib Hadir Harian vs Sesuai Jadwal Mengajar per Pegawai */}
+          {masterList.length > 0 && (
+            <div className="p-4 bg-teal-50/50 rounded-xl border border-teal-200 space-y-3.5">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="flex items-start gap-2">
+                  <Users className="w-4 h-4 text-teal-700 shrink-0 mt-0.5" />
+                  <div>
+                    <h4 className="text-xs sm:text-sm font-bold text-slate-800">
+                      Pengaturan Siapa Wajib Hadir Setiap Hari ({threshold || '07:25'}) vs Sesuai Jadwal
+                    </h4>
+                    <p className="text-[11px] text-slate-600 leading-relaxed mt-0.5">
+                      Guru Mapel otomatis memakai <strong>Sesuai Jadwal Mengajar</strong> (mis. masuk Jam III-IV pkl. 08:30 tidak dianggap terlambat).
+                      Staf &amp; Guru BK otomatis <strong>Wajib Hadir Harian ({threshold || '07:25'})</strong>. Ubah per orang di sini bila ada pengecualian, lalu klik <strong>Simpan Pengaturan</strong>.
+                    </p>
+                  </div>
+                </div>
+                {Object.keys(attendanceRuleOverrides).length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setAttendanceRuleOverrides({})}
+                    className="px-2.5 py-1.5 bg-white hover:bg-rose-50 text-rose-700 border border-rose-200 rounded-lg text-[11px] font-bold flex items-center gap-1 shrink-0 self-start"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    <span>Reset ke Otomatis</span>
+                  </button>
+                )}
+              </div>
+
+              {/* Filter & Search Bar */}
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2">
+                <div className="flex flex-wrap gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setRuleFilter('semua')}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition ${
+                      ruleFilter === 'semua'
+                        ? 'bg-[#2F5597] text-white border-[#2F5597]'
+                        : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                    }`}
+                  >
+                    Semua ({ruleRows.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRuleFilter('sesuai_jadwal')}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition ${
+                      ruleFilter === 'sesuai_jadwal'
+                        ? 'bg-indigo-600 text-white border-indigo-600'
+                        : 'bg-white text-indigo-800 border-indigo-200 hover:bg-indigo-50'
+                    }`}
+                  >
+                    Sesuai Jadwal ({ruleCounts.sesuaiJadwal})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRuleFilter('wajib_harian')}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition ${
+                      ruleFilter === 'wajib_harian'
+                        ? 'bg-slate-700 text-white border-slate-700'
+                        : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-100'
+                    }`}
+                  >
+                    Wajib Harian ({ruleCounts.wajibHarian})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRuleFilter('ganda')}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition ${
+                      ruleFilter === 'ganda'
+                        ? 'bg-amber-600 text-white border-amber-600'
+                        : 'bg-white text-amber-800 border-amber-200 hover:bg-amber-50'
+                    }`}
+                  >
+                    Ganda ({ruleCounts.ganda})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRuleFilter('guru_bk')}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition ${
+                      ruleFilter === 'guru_bk'
+                        ? 'bg-teal-600 text-white border-teal-600'
+                        : 'bg-white text-teal-800 border-teal-200 hover:bg-teal-50'
+                    }`}
+                  >
+                    Guru BK ({ruleCounts.guruBk})
+                  </button>
+                </div>
+
+                <div className="relative sm:w-56">
+                  <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="text"
+                    placeholder="Cari nama / jabatan..."
+                    value={ruleSearch}
+                    onChange={(e) => setRuleSearch(e.target.value)}
+                    className="w-full pl-8 pr-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs focus:ring-2 focus:ring-[#2F5597]"
+                  />
+                </div>
+              </div>
+
+              {/* Scrollable List */}
+              <div className="bg-white rounded-xl border border-slate-200 divide-y divide-slate-100 max-h-80 overflow-y-auto">
+                {filteredRuleRows.length === 0 ? (
+                  <div className="p-4 text-center text-xs text-slate-400">
+                    Tidak ada pegawai yang cocok dengan filter ini.
+                  </div>
+                ) : (
+                  filteredRuleRows.map(({ teacher, effectiveRule, selectedOverride }, idx) => (
+                    <div
+                      key={`rule-row-${teacher.no || idx}-${teacher.nama}`}
+                      className="px-3 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 hover:bg-slate-50/80"
+                    >
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="text-xs font-bold text-slate-900">{teacher.nama}</span>
+                          <span
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-extrabold border ${
+                              effectiveRule.peran === 'Guru'
+                                ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
+                                : effectiveRule.peran === 'Guru BK'
+                                ? 'bg-teal-50 text-teal-800 border-teal-200'
+                                : effectiveRule.peran === 'Guru BK+Mengajar'
+                                ? 'bg-purple-50 text-purple-800 border-purple-200'
+                                : effectiveRule.peran === 'Guru+Staf'
+                                ? 'bg-amber-50 text-amber-800 border-amber-200'
+                                : 'bg-slate-100 text-slate-700 border-slate-300'
+                            }`}
+                          >
+                            {effectiveRule.peran}
+                          </span>
+                          {effectiveRule.isExplicitOverride && (
+                            <span className="px-1.5 py-0.5 rounded text-[9.5px] font-bold bg-blue-100 text-blue-800">
+                              Diatur Manual
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-slate-500 truncate mt-0.5">
+                          {teacher.jabatan} &bull;{' '}
+                          <span className="font-semibold text-slate-700">
+                            {effectiveRule.ruleMode === 'sesuai_jadwal'
+                              ? 'Hadir sesuai jam mengajar pertama hari itu'
+                              : effectiveRule.ruleMode === 'wajib_harian'
+                              ? `Wajib hadir harian maks. ${threshold || '07:25'} WIB`
+                              : `Ganda: wajib harian ${threshold || '07:25'} WIB + jam mengajar`}
+                          </span>
+                        </div>
+                      </div>
+
+                      <select
+                        value={selectedOverride}
+                        onChange={(e) => handleOverrideChange(teacher.nama, e.target.value as AttendanceRuleMode | '')}
+                        className="px-2.5 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-[11px] font-bold text-slate-800 focus:ring-2 focus:ring-[#2F5597] shrink-0"
+                      >
+                        <option value="">Otomatis (Ikut Sistem)</option>
+                        <option value="sesuai_jadwal">Sesuai Jadwal Mengajar</option>
+                        <option value="wajib_harian">Wajib Hadir Setiap Hari ({threshold || '07:25'})</option>
+                        <option value="ganda">Ganda (Harian {threshold || '07:25'} + Mengajar)</option>
+                      </select>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Quota Settings Section */}
           <div className="pt-4 border-t border-slate-100 space-y-4">

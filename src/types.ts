@@ -7,7 +7,10 @@ export type StatusPresensi =
   | 'Alpa'
   | 'Alpa (Jadwal Mengajar)'
   | 'Alpa (Wajib Hadir Staf)'
+  | 'Alpa (Wajib Hadir Guru BK)'
   | 'Dinas Luar';
+
+export type AttendanceRuleMode = 'sesuai_jadwal' | 'wajib_harian' | 'ganda';
 
 export type HariSekolah = 'Sabtu' | 'Ahad' | 'Senin' | 'Selasa' | 'Rabu' | 'Kamis' | 'Jumat';
 
@@ -41,7 +44,7 @@ export interface MasterGuruStaf {
   jabatan: string;
   kodeUnik?: string; // Unique QR/Barcode Identifier e.g. GURU-001
   kodeGuru?: number;
-  peran?: string; // 'Guru' | 'Staf' | 'Guru+Staf'
+  peran?: string; // 'Guru' | 'Staf' | 'Guru+Staf' | 'Guru BK' | 'Guru BK+Mengajar'
   mapelSabtu: string;
   mapelAhad: string;
   mapelSenin: string;
@@ -77,7 +80,7 @@ export interface LogPresensi {
   keterangan: string;
   metodePresensi?: 'Manual' | 'QR HP Guru' | 'QR Kios Piket';
   koordinatLokasi?: string; // Lat, Lng when scanned via mobile
-  peran?: string; // 'Guru' | 'Staf' | 'Guru+Staf'
+  peran?: string; // 'Guru' | 'Staf' | 'Guru+Staf' | 'Guru BK' | 'Guru BK+Mengajar'
   batasStaf?: string; // HH:mm or '-'
   statusStaf?: string; // 'Tepat Waktu' | 'Terlambat' or '-'
   batasMengajar?: string; // HH:mm or '-'
@@ -104,9 +107,10 @@ export interface DataCutiRecord {
 export interface AppSettings {
   webAppUrl: string;
   sheetUrl: string;
-  jamMasukThreshold: string; // e.g. '07:25' (Instruksi resmi Kepala Sekolah / Batas Staf)
+  jamMasukThreshold: string; // e.g. '07:25' (Instruksi resmi Kepala Sekolah / Batas Staf & Guru BK)
   guruToleransiMenit: number; // e.g. 0
   guruTanpaJadwalWajibHadir: boolean; // e.g. false
+  attendanceRuleOverrides?: Record<string, AttendanceRuleMode>; // Keyed by normalized teacher/staff name
   kebijakanKehadiran?: 'instruksi_kepala_sekolah' | 'sesuai_jadwal_mengajar'; // Dual recognition (legacy)
   adminPin?: string; // (Deprecated - PIN kini divalidasi server-side via Script Properties)
   jadwalTahunAjaran?: string; // e.g. '2026/2027'

@@ -482,9 +482,11 @@ export const MasterDataModal: React.FC<MasterDataModalProps> = ({
                   className="w-full px-3 py-2 bg-white border border-slate-300 rounded-xl text-xs sm:text-sm font-bold text-slate-800 focus:ring-2 focus:ring-[#2F5597]"
                 >
                   <option value="">Otomatis (kosong)</option>
-                  <option value="Guru">Guru</option>
-                  <option value="Staf">Staf</option>
-                  <option value="Guru+Staf">Guru+Staf</option>
+                  <option value="Guru">Guru (Sesuai Jadwal Mengajar)</option>
+                  <option value="Staf">Staf (Wajib Hadir Harian)</option>
+                  <option value="Guru+Staf">Guru+Staf (Ganda: Harian + Mengajar)</option>
+                  <option value="Guru BK">Guru BK (Wajib Hadir Guru BK)</option>
+                  <option value="Guru BK+Mengajar">Guru BK+Mengajar (Ganda: Guru BK + Mengajar)</option>
                 </select>
                 <p className="text-[10px] text-slate-400 mt-0.5">Penetapan aturan jam datang &amp; evaluasi.</p>
               </div>
@@ -628,6 +630,10 @@ export const MasterDataModal: React.FC<MasterDataModalProps> = ({
                           ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
                           : m.peran === 'Guru+Staf'
                           ? 'bg-amber-50 text-amber-800 border-amber-200'
+                          : m.peran === 'Guru BK'
+                          ? 'bg-teal-50 text-teal-800 border-teal-200'
+                          : m.peran === 'Guru BK+Mengajar'
+                          ? 'bg-purple-50 text-purple-800 border-purple-200'
                           : 'bg-slate-100 text-slate-700 border-slate-300'
                       }`}>
                         {m.peran}

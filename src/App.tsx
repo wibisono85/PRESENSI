@@ -162,7 +162,8 @@ export default function App() {
       masterList,
       threshold: settings.jamMasukThreshold || '07:25',
       jadwalList,
-      guruTanpaJadwalWajibHadir: settings.guruTanpaJadwalWajibHadir
+      guruTanpaJadwalWajibHadir: settings.guruTanpaJadwalWajibHadir,
+      attendanceRuleOverrides: settings.attendanceRuleOverrides
     });
 
     if (missingDailyLogs.length > 0 && settings.webAppUrl && res.syncedToSheet) {
@@ -335,6 +336,8 @@ export default function App() {
             onRefresh={() => loadData(settings.webAppUrl)}
             onDeleteLog={handleDeleteLog}
             isRefreshing={isRefreshing}
+            settings={settings}
+            jadwalList={jadwalList}
           />
         )}
 
@@ -382,6 +385,8 @@ export default function App() {
             onTestConnection={() => loadData(settings.webAppUrl)}
             onSeedMasterData={handleSeedMaster}
             masterCount={masterList.length}
+            masterList={masterList}
+            jadwalList={jadwalList}
           />
         )}
 

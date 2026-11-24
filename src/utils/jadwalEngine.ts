@@ -194,6 +194,7 @@ export function isJadwalTidakDitemukan(
   const peran = (teacher.peran || '').toLowerCase();
   const isPureStaff =
     peran === 'staf' ||
+    peran === 'guru bk' ||
     (!jab.includes('guru') &&
       (jab.includes('tu') ||
         jab.includes('satpam') ||
@@ -206,6 +207,15 @@ export function isJadwalTidakDitemukan(
   if (isPureStaff) return false;
 
   const kode = cariKodeGuru(teacher);
+  const isBkJabatan =
+    /\bbk\b/.test(jab) ||
+    jab.includes('bimbingan konseling') ||
+    jab.includes('bimbingan & konseling') ||
+    jab.includes('konselor');
+  if (isBkJabatan && kode === null && peran !== 'guru' && peran !== 'guru+staf' && peran !== 'guru bk+mengajar') {
+    return false;
+  }
+
   return kode === null;
 }
 
