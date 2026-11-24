@@ -25,6 +25,7 @@ import {
 } from './utils/googleAppsScript';
 import { getLocalJadwal } from './utils/jadwalEngine';
 import { formatDateISO } from './utils/dateUtils';
+import { buildMissingDailyCutiLogs } from './utils/cutiUtils';
 
 import { Header } from './components/Header';
 import { ScanPresensiView } from './components/ScanPresensiView';
@@ -149,14 +150,43 @@ export default function App() {
     return res;
   };
 
-  // Handler for batch syncing all recorded Cuti entries to Data_Cuti sheet
+  // Handler for batch syncing all recorded Cuti entries to Data_Cuti AND missing daily rows to Log_Presensi
   const handleSyncAllCuti = async (records: DataCutiRecord[]) => {
     const res = await syncCutiRecordsRemote(settings.webAppUrl, records);
+    let logSyncNote = '';
+    let logSyncFailed = false;
+
+    const missingDailyLogs = buildMissingDailyCutiLogs({
+      cutiRecords: records,
+      existingLogs: logs,
+      masterList,
+      threshold: settings.jamMasukThreshold || '07:25',
+      jadwalList,
+      guruTanpaJadwalWajibHadir: settings.guruTanpaJadwalWajibHadir
+    });
+
+    if (missingDailyLogs.length > 0 && settings.webAppUrl && res.syncedToSheet) {
+      const logRes = await batchUpsertLogs(settings.webAppUrl, missingDailyLogs);
+      if (logRes.success) {
+        logSyncNote = ` + ${missingDailyLogs.length} catatan harian Cuti ditambahkan ke Log_Presensi.`;
+      } else {
+        logSyncFailed = true;
+        logSyncNote = ` Namun sinkronisasi ke Log_Presensi gagal: ${logRes.message}`;
+      }
+    } else if (missingDailyLogs.length === 0 && res.syncedToSheet) {
+      logSyncNote = ' Semua catatan harian di Log_Presensi sudah lengkap.';
+    }
+
     if (res.syncedToSheet) {
       setHasRemoteCutiSheet(true);
       await loadData(settings.webAppUrl);
     }
-    return res;
+
+    return {
+      ...res,
+      success: res.success && !logSyncFailed,
+      message: `${res.message}${logSyncNote}`.trim()
+    };
   };
 
   // Handler for seeding master data to Google Sheets

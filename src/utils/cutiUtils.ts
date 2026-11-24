@@ -1,5 +1,6 @@
-import { HariSekolah } from '../types';
-import { getHariFromDate, isJumat, formatLongDateIndonesian } from './dateUtils';
+import { DataCutiRecord, HariSekolah, JadwalSlot, LogPresensi, MasterGuruStaf } from '../types';
+import { getHariFromDate, isJumat, formatLongDateIndonesian, formatTimestamp, getMapelHariIni } from './dateUtils';
+import { determineTeacherPeran, evaluateTeacherScheduleForDay, isTeacherWajibHadir } from './scheduleTimeEvaluator';
 
 export interface JenisCutiOption {
   id: string;
@@ -214,3 +215,105 @@ export function formatCutiKeterangan(params: {
 
   return parts.join(' • ');
 }
+
+/**
+ * Generates missing daily Log_Presensi entries ('Cuti') from summary Data_Cuti records.
+ * Only creates entries for dates where existingLogs does NOT already contain a log for that teacher & date.
+ */
+export function buildMissingDailyCutiLogs(params: {
+  cutiRecords: DataCutiRecord[];
+  existingLogs: LogPresensi[];
+  masterList: MasterGuruStaf[];
+  threshold: string;
+  jadwalList?: JadwalSlot[];
+  guruTanpaJadwalWajibHadir?: boolean;
+}): LogPresensi[] {
+  const { cutiRecords, existingLogs, masterList, threshold, jadwalList, guruTanpaJadwalWajibHadir } = params;
+  if (!cutiRecords || cutiRecords.length === 0) return [];
+
+  const existingKeys = new Set<string>();
+  for (const l of existingLogs) {
+    if (!l.nama || !l.tanggal) continue;
+    existingKeys.add(`${l.nama.trim().toLowerCase()}|${l.tanggal.trim()}`);
+  }
+
+  const masterByName = new Map<string, MasterGuruStaf>();
+  for (const m of masterList) {
+    if (m.nama) {
+      masterByName.set(m.nama.trim().toLowerCase(), m);
+    }
+  }
+
+  const missingLogs: LogPresensi[] = [];
+  const nowTs = formatTimestamp();
+
+  for (const rec of cutiRecords) {
+    if (!rec.nama || !rec.tanggalMulai) continue;
+    if (String(rec.statusPengajuan || '').trim().toLowerCase() === 'dibatalkan') continue;
+
+    const endDate = rec.tanggalSelesai || rec.tanggalMulai;
+    const range = enumerateSchoolDatesInRange(rec.tanggalMulai, endDate, 180);
+    if (!range.valid || range.schoolDates.length === 0) continue;
+
+    const normName = rec.nama.trim().toLowerCase();
+    const teacher = masterByName.get(normName);
+
+    let targetDates = range.schoolDates;
+    if (rec.cakupan === 'wajib_hadir' && teacher) {
+      const wajibOnly = range.schoolDates.filter((d) =>
+        isTeacherWajibHadir(teacher, d.hari, jadwalList, guruTanpaJadwalWajibHadir)
+      );
+      if (wajibOnly.length > 0) {
+        targetDates = wajibOnly;
+      }
+    }
+
+    const peranGuru = rec.peran && rec.peran !== '-'
+      ? rec.peran
+      : teacher
+      ? determineTeacherPeran(teacher, jadwalList)
+      : 'Guru';
+
+    const keterangan = formatCutiKeterangan({
+      jenisCutiLabel: rec.jenisCuti || 'Cuti',
+      tanggalMulai: rec.tanggalMulai,
+      tanggalSelesai: endDate,
+      jumlahHariEfektif: rec.jumlahHariEfektif || targetDates.length,
+      guruPengganti: rec.guruPengganti && rec.guruPengganti !== '-' ? rec.guruPengganti : '',
+      nomorSurat: rec.nomorSurat && rec.nomorSurat !== '-' ? rec.nomorSurat : '',
+      catatan: rec.catatan && rec.catatan !== '-' ? rec.catatan : ''
+    });
+
+    for (const d of targetDates) {
+      const key = `${normName}|${d.tanggal}`;
+      if (existingKeys.has(key)) continue;
+      existingKeys.add(key);
+
+      let mapelOnDate = '-';
+      if (teacher) {
+        const schedEval = evaluateTeacherScheduleForDay(teacher, d.hari, threshold, jadwalList);
+        mapelOnDate = schedEval.hasTeachingSchedule
+          ? schedEval.mapelHariIni
+          : getMapelHariIni(teacher, d.hari, jadwalList);
+      }
+
+      missingLogs.push({
+        id: `CUTI-${Date.now()}-${missingLogs.length}-${Math.random().toString(36).substring(2, 6)}`,
+        timestamp: rec.waktuPengajuan || nowTs,
+        tanggal: d.tanggal,
+        hari: d.hari,
+        nama: teacher?.nama || rec.nama,
+        jabatan: teacher?.jabatan || rec.jabatan || '-',
+        mapelHariIni: mapelOnDate,
+        jamDatang: '-',
+        status: 'Cuti',
+        keterangan,
+        metodePresensi: 'Manual',
+        peran: peranGuru
+      });
+    }
+  }
+
+  return missingLogs;
+}
+

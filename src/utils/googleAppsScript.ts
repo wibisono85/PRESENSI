@@ -74,7 +74,7 @@ function doPost(e) {
         return createJsonResponse({ status: 'error', message: 'Field Nama dan Tanggal wajib diisi.' });
       }
       
-      var logSheet = findSheetFlexible(ss, ['Log_Presensi', 'Log Presensi', 'Log', 'Presensi', 'Data_Presensi'], ['log', 'presensi']);
+      var logSheet = findSheetFlexible(ss, ['Log_Presensi', 'Log Presensi', 'Data_Presensi', 'Presensi', 'Log'], ['log_presensi', 'log presensi', 'data_presensi', 'presensi']);
       if (!logSheet) {
         logSheet = ss.insertSheet('Log_Presensi');
       }
@@ -135,7 +135,7 @@ function doPost(e) {
       }
 
       try {
-        var logSheet = findSheetFlexible(ss, ['Log_Presensi', 'Log Presensi', 'Log', 'Presensi', 'Data_Presensi'], ['log', 'presensi']);
+        var logSheet = findSheetFlexible(ss, ['Log_Presensi', 'Log Presensi', 'Data_Presensi', 'Presensi', 'Log'], ['log_presensi', 'log presensi', 'data_presensi', 'presensi']);
         if (!logSheet) {
           logSheet = ss.insertSheet('Log_Presensi');
         }
@@ -214,7 +214,7 @@ function doPost(e) {
 
     } else if (action === 'deleteLog') {
       var logId = payload.id;
-      var logSheet = findSheetFlexible(ss, ['Log_Presensi', 'Log Presensi', 'Log', 'Presensi', 'Data_Presensi'], ['log', 'presensi']);
+      var logSheet = findSheetFlexible(ss, ['Log_Presensi', 'Log Presensi', 'Data_Presensi', 'Presensi', 'Log'], ['log_presensi', 'log presensi', 'data_presensi', 'presensi']);
       if (logSheet) {
         var rows = logSheet.getDataRange().getValues();
         for (var i = 1; i < rows.length; i++) {
@@ -683,7 +683,7 @@ function doPost(e) {
 
         var deletedLogRows = 0;
         if (alsoDeleteLogs && delNama && delStart && delEnd) {
-          var logSheetDel = findSheetFlexible(ss, ['Log_Presensi', 'Log Presensi', 'Log', 'Presensi', 'Data_Presensi'], ['log', 'presensi']);
+          var logSheetDel = findSheetFlexible(ss, ['Log_Presensi', 'Log Presensi', 'Data_Presensi', 'Presensi', 'Log'], ['log_presensi', 'log presensi', 'data_presensi', 'presensi']);
           if (logSheetDel) {
             var lRows = logSheetDel.getDataRange().getValues();
             for (var lr = lRows.length - 1; lr >= 1; lr--) {
@@ -847,7 +847,7 @@ function ensureSheets(ss) {
     ]);
   }
   
-  var logSheet = findSheetFlexible(ss, ['Log_Presensi', 'Log Presensi', 'Log', 'Presensi', 'Data_Presensi'], ['log', 'presensi']);
+  var logSheet = findSheetFlexible(ss, ['Log_Presensi', 'Log Presensi', 'Data_Presensi', 'Presensi', 'Log'], ['log_presensi', 'log presensi', 'data_presensi', 'presensi']);
   if (!logSheet) {
     logSheet = ss.insertSheet('Log_Presensi');
     logSheet.appendRow([
@@ -965,6 +965,14 @@ function backfillCutiFromLogs(ss, cutiSheet) {
 
 function ensureLogHeaders(sheet) {
   if (!sheet) return;
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow([
+      'ID', 'Timestamp', 'Tanggal', 'Hari', 'Nama',
+      'Jabatan', 'Mapel Diampu Hari Ini', 'Jam Datang', 'Status', 'Keterangan',
+      'Peran', 'Batas Staf', 'Status Staf', 'Batas Mengajar', 'Status Mengajar'
+    ]);
+    return;
+  }
   var lastCol = sheet.getLastColumn();
   var numColsToCheck = Math.max(lastCol, 15);
   var headerValues = sheet.getRange(1, 1, 1, numColsToCheck).getDisplayValues()[0];
@@ -1266,7 +1274,7 @@ function getCutiData(ss) {
 function getLogData(ss) {
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) return [];
-  var sheet = findSheetFlexible(ss, ['Log_Presensi', 'Log Presensi', 'Log', 'Presensi', 'Data_Presensi'], ['log', 'presensi']);
+  var sheet = findSheetFlexible(ss, ['Log_Presensi', 'Log Presensi', 'Data_Presensi', 'Presensi', 'Log'], ['log_presensi', 'log presensi', 'data_presensi', 'presensi']);
   if (!sheet && ss.getSheets().length > 0) sheet = ss.getSheets()[0];
   if (!sheet) return [];
   ensureLogHeaders(sheet);
@@ -2811,6 +2819,15 @@ export async function syncCutiRecordsRemote(
     if (res.ok && json && json.status === 'success') {
       if (typeof window !== 'undefined') {
         localStorage.setItem(STORAGE_KEY_HAS_REMOTE_CUTI, 'true');
+        const current = getLocalCutiData();
+        const mergedMap = new Map<string, DataCutiRecord>();
+        for (const c of current) {
+          mergedMap.set(c.id, c);
+        }
+        for (const r of records) {
+          mergedMap.set(r.id, r);
+        }
+        saveLocalCutiData(Array.from(mergedMap.values()));
       }
       return {
         success: true,

@@ -1388,7 +1388,7 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-teal-600 hover:bg-teal-700 text-white rounded-xl text-xs font-bold transition disabled:opacity-50"
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${isSyncingCuti ? 'animate-spin' : ''}`} />
-                  <span>{isSyncingCuti ? 'Menyinkronkan...' : 'Sinkronkan ke Data_Cuti'}</span>
+                  <span>{isSyncingCuti ? 'Menyinkronkan...' : 'Sinkronkan Data_Cuti & Log_Presensi'}</span>
                 </button>
               )}
 
@@ -1414,7 +1414,7 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
                 <div>
                   <span className="font-bold block">Tab Data_Cuti Belum Aktif / Belum Deploy Versi Baru</span>
                   <span className="text-[11px] text-amber-800 leading-relaxed block mt-0.5">
-                    Jika Anda sudah menempel kode <code className="font-mono font-bold">Code.gs</code> terbaru, pastikan Anda sudah melakukan <strong>Deploy &gt; Manage deployments &gt; Edit (ikon pensil) &gt; Versi: New version &gt; Deploy</strong> (bukan hanya klik Save), lalu klik tombol <strong>Sinkronkan ke Data_Cuti</strong> di atas.
+                    Jika Anda sudah menempel kode <code className="font-mono font-bold">Code.gs</code> terbaru, pastikan Anda sudah melakukan <strong>Deploy &gt; Manage deployments &gt; Edit (ikon pensil) &gt; Versi: New version &gt; Deploy</strong> (bukan hanya klik Save), lalu klik tombol <strong>Sinkronkan Data_Cuti &amp; Log_Presensi</strong> di atas.
                   </span>
                 </div>
               </div>
@@ -1439,6 +1439,29 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
             </div>
           )}
 
+          {settings?.webAppUrl &&
+            hasRemoteCutiSheet &&
+            combinedCutiRecords.some((rec) => {
+              const norm = rec.nama.trim().toLowerCase();
+              return !existingLogs.some(
+                (l) =>
+                  l.status === 'Cuti' &&
+                  l.nama.trim().toLowerCase() === norm &&
+                  l.tanggal >= rec.tanggalMulai &&
+                  l.tanggal <= rec.tanggalSelesai
+              );
+            }) && (
+              <div className="p-3.5 bg-sky-50 border border-sky-200 rounded-xl flex items-start gap-2.5 text-xs text-sky-900">
+                <Info className="w-4 h-4 text-sky-600 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-bold block">Ada catatan cuti di Data_Cuti yang belum memiliki baris harian di Log_Presensi</span>
+                  <span className="text-[11px] text-sky-800 block mt-0.5">
+                    Klik tombol <strong>Sinkronkan Data_Cuti &amp; Log_Presensi</strong> di atas untuk otomatis membuatkan catatan harian berstatus <strong>Cuti</strong> ke sheet <code className="font-mono font-bold">Log_Presensi</code>.
+                  </span>
+                </div>
+              </div>
+            )}
+
           {combinedCutiRecords.length === 0 ? (
             <div className="text-center py-8 text-xs text-slate-500 bg-slate-50 rounded-xl border border-dashed border-slate-200">
               Belum ada catatan cuti guru atau staf yang tersimpan.
@@ -1448,11 +1471,24 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
               {combinedCutiRecords.map((rec) => {
                 const isConfirming = confirmDeleteCutiId === rec.id;
                 const isDeleting = deletingCutiId === rec.id;
+                const normRecName = rec.nama.trim().toLowerCase();
                 const isSyncedToRemoteSheet =
                   Boolean(settings?.webAppUrl) &&
                   hasRemoteCutiSheet &&
-                  !rec.id.startsWith('DERIVED-') &&
-                  cutiList.some((c) => c.id === rec.id);
+                  cutiList.some(
+                    (c) =>
+                      c.id === rec.id ||
+                      (c.nama.trim().toLowerCase() === normRecName &&
+                        c.tanggalMulai === rec.tanggalMulai &&
+                        c.tanggalSelesai === rec.tanggalSelesai)
+                  );
+                const syncedLogCount = existingLogs.filter(
+                  (l) =>
+                    l.status === 'Cuti' &&
+                    l.nama.trim().toLowerCase() === normRecName &&
+                    l.tanggal >= rec.tanggalMulai &&
+                    l.tanggal <= rec.tanggalSelesai
+                ).length;
                 return (
                   <div
                     key={rec.id}
@@ -1468,15 +1504,26 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
                           {rec.jumlahHariEfektif} hari efektif
                         </span>
                         {settings?.webAppUrl ? (
-                          isSyncedToRemoteSheet ? (
-                            <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
-                              Tersinkron di Data_Cuti
-                            </span>
-                          ) : (
-                            <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200">
-                              Belum di sheet Data_Cuti
-                            </span>
-                          )
+                          <>
+                            {isSyncedToRemoteSheet ? (
+                              <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                                Tersinkron di Data_Cuti
+                              </span>
+                            ) : (
+                              <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200">
+                                Belum di sheet Data_Cuti
+                              </span>
+                            )}
+                            {syncedLogCount > 0 ? (
+                              <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-sky-50 text-sky-800 border border-sky-200">
+                                Log_Presensi: {syncedLogCount} hari
+                              </span>
+                            ) : (
+                              <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-rose-50 text-rose-700 border border-rose-200">
+                                Belum di Log_Presensi
+                              </span>
+                            )}
+                          </>
                         ) : (
                           <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-slate-100 text-slate-600 border border-slate-200">
                             Tersimpan Lokal
