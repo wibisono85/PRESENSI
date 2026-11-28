@@ -52,8 +52,10 @@ import {
   X,
   BellRing,
   UserCheck,
-  UserX
+  UserX,
+  FileText
 } from 'lucide-react';
+import { LaporanResmiModal } from './LaporanResmiModal';
 
 interface DashboardViewProps {
   logs: LogPresensi[];
@@ -102,6 +104,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ logs, masterList, 
 
   // Top candidates count for Teladan leaderboard
   const [topTeladanCount, setTopTeladanCount] = useState<number>(5);
+
+  // Formal Simple Report Modal (Times New Roman 12pt)
+  const [showFormalReportModal, setShowFormalReportModal] = useState<boolean>(false);
 
   // Expanded card state for details viewing
   const [expandedQuotaKeys, setExpandedQuotaKeys] = useState<Record<string, boolean>>({});
@@ -953,6 +958,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ logs, masterList, 
                   <span>Mode Presentasi</span>
                 </>
               )}
+            </button>
+
+            {/* Formal Simple Report (Bulanan / Semester - Times New Roman 12pt) */}
+            <button
+              type="button"
+              onClick={() => setShowFormalReportModal(true)}
+              className="px-3.5 py-2 bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 shadow-sm transition-all cursor-pointer"
+              title="Cetak laporan rekap sederhana khusus pimpinan (Times New Roman 12pt)"
+            >
+              <FileText className="w-4 h-4 text-amber-200" />
+              <span>Cetak Laporan Sederhana (12pt)</span>
             </button>
 
             {/* Print / Download Report */}
@@ -2055,6 +2071,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ logs, masterList, 
           </div>
         </div>
       </div>
+
+      {/* Modal Cetak Laporan Rekap Sederhana (Times New Roman 12pt — Bulanan & Semester) */}
+      <LaporanResmiModal
+        isOpen={showFormalReportModal}
+        onClose={() => setShowFormalReportModal(false)}
+        logs={logs}
+        masterList={masterList}
+        settings={settings}
+        defaultStartDate={startDate}
+        defaultEndDate={endDate}
+      />
     </div>
   );
 };

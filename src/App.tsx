@@ -614,12 +614,15 @@ export default function App() {
           <RekapRiwayat
             logs={logs}
             masterList={masterList}
+            cutiList={cutiList}
             sheetUrl={settings.sheetUrl}
             onRefresh={() => loadData(settings.webAppUrl)}
             onDeleteLog={handleDeleteLog}
             isRefreshing={isRefreshing}
             settings={settings}
             jadwalList={jadwalList}
+            onSendWaReminder={(customMessage) => handleSendWaReminder(customMessage, true)}
+            waGatewayStatus={waGatewayStatus}
           />
         )}
 

@@ -28,5 +28,36 @@
     break-inside: avoid !important;
     -webkit-column-break-inside: avoid !important;
   }
+
+  /* Isolasi cetak khusus Laporan Rekap Sederhana (Times New Roman 12pt) */
+  body.printing-laporan-resmi #root {
+    display: none !important;
+  }
+
+  body.printing-laporan-resmi .laporan-resmi-print-hide {
+    display: none !important;
+  }
+
+  body.printing-laporan-resmi #laporan-resmi-portal {
+    position: static !important;
+    inset: auto !important;
+    overflow: visible !important;
+    background: #ffffff !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    display: block !important;
+    height: auto !important;
+    width: 100% !important;
+  }
+
+  body.printing-laporan-resmi #laporan-resmi-printable {
+    box-shadow: none !important;
+    border: none !important;
+    border-radius: 0 !important;
+    margin: 0 auto !important;
+    padding: 0 !important;
+    width: 100% !important;
+    max-width: none !important;
+  }
 }
 

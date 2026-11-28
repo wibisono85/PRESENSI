@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import { AppSettings, JadwalSlot, LogPresensi, StatusPresensi, MasterGuruStaf } from '../types';
+import { AppSettings, DataCutiRecord, JadwalSlot, LogPresensi, StatusPresensi, MasterGuruStaf } from '../types';
 import { determineTeacherPeran, isGuruBkJabatan } from '../utils/scheduleTimeEvaluator';
 import {
   formatDateISO,
@@ -8,6 +8,9 @@ import {
   getThisMonthRangeISO,
   getLastMonthRangeISO
 } from '../utils/dateUtils';
+import { DEFAULT_WHATSAPP_GROUP_URL, WaGatewayStatus, getStoredSettings } from '../utils/googleAppsScript';
+import { buildDailyRekapWaMessage, computeDailyRekapWaSummary } from '../utils/waReminderUtils';
+import { LaporanResmiModal } from './LaporanResmiModal';
 import {
   Search,
   Calendar,
@@ -26,18 +29,29 @@ import {
   ShieldAlert,
   CheckCircle2,
   AlertTriangle,
-  CalendarRange
+  CalendarRange,
+  MessageSquare,
+  Send,
+  Copy,
+  ChevronDown,
+  ChevronUp,
+  FileText
 } from 'lucide-react';
 
 interface RekapRiwayatProps {
   logs: LogPresensi[];
   masterList?: MasterGuruStaf[];
+  cutiList?: DataCutiRecord[];
   sheetUrl: string;
   onRefresh: () => void;
   onDeleteLog: (id: string) => Promise<void>;
   isRefreshing: boolean;
   settings?: AppSettings;
   jadwalList?: JadwalSlot[];
+  onSendWaReminder?: (
+    customMessage: string
+  ) => Promise<{ success: boolean; sent: boolean; message: string }>;
+  waGatewayStatus?: WaGatewayStatus;
 }
 
 export type PeriodType = 'harian' | 'minggu_ini' | 'bulan_ini' | 'bulan_lalu' | 'custom' | 'semua';
@@ -47,12 +61,15 @@ export type RekapTab = 'transaksi' | 'pelanggaran';
 export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
   logs,
   masterList,
+  cutiList = [],
   sheetUrl,
   onRefresh,
   onDeleteLog,
   isRefreshing,
   settings,
-  jadwalList
+  jadwalList,
+  onSendWaReminder,
+  waGatewayStatus
 }) => {
   // Period filter states
   const [periodType, setPeriodType] = useState<PeriodType>('harian');
@@ -67,6 +84,64 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedStatus, setSelectedStatus] = useState<string>('semua');
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+
+  // Formal Simple Report Modal (Times New Roman 12pt)
+  const [showFormalReportModal, setShowFormalReportModal] = useState<boolean>(false);
+
+  // Daily WA Group Recap Panel states
+  const [waRekapDate, setWaRekapDate] = useState<string>(formatDateISO());
+  const [showWaRekapPreview, setShowWaRekapPreview] = useState<boolean>(false);
+  const [includeTepatNamesInWa, setIncludeTepatNamesInWa] = useState<boolean>(false);
+  const [includeBelumInWa, setIncludeBelumInWa] = useState<boolean>(true);
+  const [waRekapCopied, setWaRekapCopied] = useState<boolean>(false);
+  const [isSendingWaRekapServer, setIsSendingWaRekapServer] = useState<boolean>(false);
+  const [waRekapServerResult, setWaRekapServerResult] = useState<{ success: boolean; text: string } | null>(null);
+
+  const effectiveSettings = useMemo(() => settings || getStoredSettings(), [settings]);
+  const waGroupUrl = effectiveSettings.whatsappGroupUrl || DEFAULT_WHATSAPP_GROUP_URL;
+
+  const dailyWaSummary = useMemo(() => {
+    return computeDailyRekapWaSummary({
+      masterList: masterList || [],
+      logs,
+      cutiList,
+      settings: effectiveSettings,
+      jadwalList,
+      tanggal: waRekapDate
+    });
+  }, [masterList, logs, cutiList, effectiveSettings, jadwalList, waRekapDate]);
+
+  const dailyWaMessage = useMemo(() => {
+    return buildDailyRekapWaMessage({
+      summary: dailyWaSummary,
+      includeTepatWaktuNames: includeTepatNamesInWa,
+      includeBelumAbsen: includeBelumInWa
+    });
+  }, [dailyWaSummary, includeTepatNamesInWa, includeBelumInWa]);
+
+  const handleCopyDailyWa = async () => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(dailyWaMessage);
+      }
+      setWaRekapCopied(true);
+      setTimeout(() => setWaRekapCopied(false), 3000);
+    } catch {
+      // ignore clipboard restrictions
+    }
+  };
+
+  const handleSendDailyWaServer = async () => {
+    if (!onSendWaReminder) return;
+    setIsSendingWaRekapServer(true);
+    setWaRekapServerResult(null);
+    try {
+      const res = await onSendWaReminder(dailyWaMessage);
+      setWaRekapServerResult({ success: res.success && res.sent, text: res.message });
+    } finally {
+      setIsSendingWaRekapServer(false);
+    }
+  };
 
   // Handle Preset Period Switch
   const handlePeriodChange = (type: PeriodType) => {
@@ -645,9 +720,19 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
           )}
 
           <button
+            type="button"
+            onClick={() => setShowFormalReportModal(true)}
+            className="px-3 py-2 bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 transition-colors shadow-sm cursor-pointer"
+            title="Cetak laporan rekap sederhana (Hadir, Terlambat, Alpa, Izin, Sakit) format Times New Roman 12pt untuk Bulanan & Semester"
+          >
+            <FileText className="w-3.5 h-3.5 text-amber-200" />
+            <span>Cetak Laporan Sederhana (12pt)</span>
+          </button>
+
+          <button
             onClick={() => window.print()}
             className="px-3 py-2 bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold rounded-xl flex items-center gap-1.5 transition-colors shadow-sm"
-            title="Cetak Laporan PDF Resmi A4"
+            title="Cetak Laporan PDF Resmi A4 Lengkap"
           >
             <Printer className="w-3.5 h-3.5 text-white" />
             <span>Cetak PDF Laporan Resmi</span>
@@ -708,6 +793,158 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
       {/* TAB 1: RIWAYAT LOG PRESENSI DENGAN PEMILIH TAMPILAN GABUNGAN / STAF / GURU */}
       {rekapTab === 'transaksi' && (
         <div className="space-y-6 animate-in fade-in duration-150">
+          {/* Panel Rekap Harian untuk Dibagikan ke Grup WhatsApp Sekolah */}
+          <div className="bg-emerald-50/75 border border-emerald-200 rounded-2xl p-4 sm:p-5 space-y-3 shadow-xs print:hidden">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-emerald-600 text-white flex items-center justify-center shrink-0 mt-0.5">
+                  <MessageSquare className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h3 className="text-xs sm:text-sm font-black text-emerald-950">
+                      Rekap Harian untuk Grup WA Sekolah
+                    </h3>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-white text-emerald-800 border border-emerald-300">
+                      {dailyWaSummary.isHoliday
+                        ? `Libur (${dailyWaSummary.hari})`
+                        : `${dailyWaSummary.terlambatList.length} Telat • ${dailyWaSummary.alpaList.length} Alpa • ${
+                            dailyWaSummary.izinList.length +
+                            dailyWaSummary.sakitList.length +
+                            dailyWaSummary.dinasLuarList.length +
+                            dailyWaSummary.cutiList.length
+                          } Izin/Sakit/Dinas/Cuti`}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-emerald-900 mt-0.5 leading-relaxed">
+                    {dailyWaSummary.isHoliday ? (
+                      <span>Hari {dailyWaSummary.hari} adalah hari libur sekolah.</span>
+                    ) : (
+                      <span>
+                        Ringkasan otomatis siapa saja hari ini yang <strong>Terlambat</strong>,{' '}
+                        <strong>Alpa</strong>, <strong>Izin / Sakit / Dinas / Cuti</strong>, serta{' '}
+                        <strong>Tepat Waktu</strong> agar mudah dibagikan ke Grup WA resmi sekolah.
+                      </span>
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <input
+                  type="date"
+                  value={waRekapDate}
+                  onChange={(e) => {
+                    if (e.target.value) setWaRekapDate(e.target.value);
+                  }}
+                  className="px-2.5 py-1.5 bg-white border border-emerald-300 rounded-xl text-xs font-bold text-slate-700"
+                  title="Pilih tanggal rekap harian WA"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowWaRekapPreview((prev) => !prev)}
+                  className="px-3 py-1.5 bg-white hover:bg-emerald-100/60 text-emerald-900 border border-emerald-300 rounded-xl text-[11px] font-bold flex items-center gap-1.5 cursor-pointer transition"
+                >
+                  <span>{showWaRekapPreview ? 'Sembunyikan Pratinjau' : 'Lihat Pratinjau Rekap WA'}</span>
+                  {showWaRekapPreview ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                </button>
+              </div>
+            </div>
+
+            {!dailyWaSummary.isHoliday && (
+              <div className="flex flex-wrap items-center gap-4 text-[11px] font-semibold text-emerald-950">
+                <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={includeTepatNamesInWa}
+                    onChange={(e) => setIncludeTepatNamesInWa(e.target.checked)}
+                    className="rounded border-emerald-400 text-emerald-600"
+                  />
+                  <span>Sertakan daftar nama Tepat Waktu ({dailyWaSummary.tepatWaktuList.length})</span>
+                </label>
+                <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={includeBelumInWa}
+                    onChange={(e) => setIncludeBelumInWa(e.target.checked)}
+                    className="rounded border-emerald-400 text-emerald-600"
+                  />
+                  <span>Sertakan yang Belum Presensi ({dailyWaSummary.belumAbsenList.length})</span>
+                </label>
+              </div>
+            )}
+
+            {showWaRekapPreview && (
+              <pre className="whitespace-pre-wrap font-sans text-[11.5px] leading-relaxed bg-white border border-emerald-200 rounded-xl p-3.5 text-slate-800 max-h-64 overflow-y-auto">
+                {dailyWaMessage}
+              </pre>
+            )}
+
+            {!dailyWaSummary.isHoliday && (
+              <div className="flex flex-wrap items-center gap-2">
+                <a
+                  href={waGroupUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={handleCopyDailyWa}
+                  className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-extrabold shadow-xs transition"
+                >
+                  <MessageSquare className="w-3.5 h-3.5 shrink-0" />
+                  <span>
+                    {waRekapCopied
+                      ? '✓ Teks Tersalin! Tempel di Grup WA Sekolah'
+                      : 'Salin Rekap & Buka Grup WA Sekolah'}
+                  </span>
+                  <ExternalLink className="w-3 h-3 shrink-0" />
+                </a>
+
+                <a
+                  href={`https://api.whatsapp.com/send?text=${encodeURIComponent(dailyWaMessage)}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center justify-center gap-1.5 px-3 py-2 bg-white hover:bg-emerald-50 text-emerald-800 border border-emerald-300 rounded-xl text-xs font-bold transition"
+                >
+                  <Send className="w-3.5 h-3.5 shrink-0" />
+                  <span>Pilih Grup di WA</span>
+                </a>
+
+                <button
+                  type="button"
+                  onClick={handleCopyDailyWa}
+                  className="inline-flex items-center justify-center gap-1.5 px-3 py-2 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-xl text-xs font-bold transition cursor-pointer"
+                >
+                  <Copy className="w-3.5 h-3.5 shrink-0" />
+                  <span>{waRekapCopied ? 'Tersalin!' : 'Salin Teks'}</span>
+                </button>
+
+                {onSendWaReminder && (
+                  <button
+                    type="button"
+                    disabled={isSendingWaRekapServer}
+                    onClick={handleSendDailyWaServer}
+                    className="inline-flex items-center justify-center gap-1.5 px-3 py-2 bg-teal-700 hover:bg-teal-800 text-white rounded-xl text-xs font-bold transition disabled:opacity-50 cursor-pointer"
+                    title="Kirim langsung via WA Gateway Apps Script apabila token Gateway & ID Grup sudah terpasang"
+                  >
+                    <Send className="w-3.5 h-3.5 shrink-0" />
+                    <span>{isSendingWaRekapServer ? 'Mengirim...' : 'Kirim via Server Gateway'}</span>
+                  </button>
+                )}
+              </div>
+            )}
+
+            {waRekapServerResult && (
+              <div
+                className={`p-2.5 rounded-xl text-[11px] font-semibold border ${
+                  waRekapServerResult.success
+                    ? 'bg-emerald-100 border-emerald-300 text-emerald-950'
+                    : 'bg-amber-50 border-amber-300 text-amber-900'
+                }`}
+              >
+                {waRekapServerResult.text}
+              </div>
+            )}
+          </div>
+
           {/* Pemilih Tampilan di Atas Rekap */}
           <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm print:hidden">
             <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
@@ -1795,6 +2032,17 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Modal Cetak Laporan Rekap Sederhana (Times New Roman 12pt — Bulanan & Semester) */}
+      <LaporanResmiModal
+        isOpen={showFormalReportModal}
+        onClose={() => setShowFormalReportModal(false)}
+        logs={logs}
+        masterList={masterList || []}
+        settings={settings}
+        defaultStartDate={startDate}
+        defaultEndDate={endDate}
+      />
     </div>
   );
 };
