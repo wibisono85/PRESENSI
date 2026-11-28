@@ -1,11 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   MasterGuruStaf,
   LogPresensi,
   AppSettings,
   StatusPresensi,
   HariSekolah,
-  JadwalSlot
+  JadwalSlot,
+  DataCutiRecord
 } from '../types';
 import {
   findTeacherByQrCode,
@@ -14,10 +15,11 @@ import {
   getSavedTeacherProfile,
   DEFAULT_SCHOOL_COORDS
 } from '../utils/qrAndGeoUtils';
-import { getHariFromDate, formatDateISO, formatTimeHHMM } from '../utils/dateUtils';
+import { getHariFromDate, formatDateISO, formatTimeHHMM, formatLongDateIndonesian } from '../utils/dateUtils';
 import { evaluateStatus24h } from '../utils/timeUtils';
 import { evaluateTeacherAttendanceStatus } from '../utils/scheduleTimeEvaluator';
 import { buildMapelString, isJadwalTidakDitemukan } from '../utils/jadwalEngine';
+import { buildEffectiveAttendanceRoster, findActiveCutiForTeacher, formatSubstituteAttendanceNote } from '../utils/cutiUtils';
 import { QrCameraScanner } from './QrCameraScanner';
 import { QrGeneratorPrintView } from './QrGeneratorPrintView';
 import { MobileSelfPresensi } from './MobileSelfPresensi';
@@ -41,6 +43,7 @@ import {
 interface ScanPresensiViewProps {
   masterList: MasterGuruStaf[];
   existingLogs: LogPresensi[];
+  cutiList?: DataCutiRecord[];
   settings: AppSettings;
   isAdmin: boolean;
   jadwalList?: JadwalSlot[];
@@ -52,6 +55,7 @@ interface ScanPresensiViewProps {
 export const ScanPresensiView: React.FC<ScanPresensiViewProps> = ({
   masterList,
   existingLogs,
+  cutiList = [],
   settings,
   isAdmin,
   jadwalList,
@@ -97,9 +101,14 @@ export const ScanPresensiView: React.FC<ScanPresensiViewProps> = ({
   const todayISO = formatDateISO();
   const hariIni = getHariFromDate(todayISO) as HariSekolah;
 
+  const effectiveRoster = useMemo(
+    () => buildEffectiveAttendanceRoster(masterList, cutiList, todayISO, jadwalList),
+    [masterList, cutiList, todayISO, jadwalList]
+  );
+
   // --- EXECUTE KIOSK PIKET SCAN (METODE 2) ---
   const handleKioskScan = async (scannedCode: string) => {
-    const teacher = findTeacherByQrCode(scannedCode, masterList);
+    const teacher = findTeacherByQrCode(scannedCode, effectiveRoster);
 
     if (!teacher) {
       playErrorBeep();
@@ -107,14 +116,42 @@ export const ScanPresensiView: React.FC<ScanPresensiViewProps> = ({
       return;
     }
 
+    const activeCuti = findActiveCutiForTeacher(teacher.nama, todayISO, cutiList, existingLogs);
     const alreadyScanned = existingLogs.find(
       (l) => l.nama.trim().toLowerCase() === teacher.nama.trim().toLowerCase() && l.tanggal === todayISO
     );
+
+    if (activeCuti || alreadyScanned?.status === 'Cuti') {
+      playErrorBeep();
+      const endLabel = activeCuti?.tanggalSelesai ? formatLongDateIndonesian(activeCuti.tanggalSelesai) : 'selesai';
+      setKioskLastScanned({
+        teacher,
+        time: '-',
+        status: 'Cuti',
+        isDuplicate: true,
+        message: `${teacher.nama} masih tercatat dalam masa ${activeCuti?.jenisCuti || 'Cuti Resmi'} (s/d ${endLabel}). Harap lapor diri ke TU / Admin terlebih dahulu untuk mencabut status cuti sebelum mengisi presensi.`
+      });
+      setKioskStatusMessage(`⚠️ Masih Masa Cuti: ${teacher.nama} — Harap lapor TU/Admin dulu`);
+      return;
+    }
 
     const now = new Date();
     const jamSekarang = formatTimeHHMM(now);
 
     if (alreadyScanned) {
+      if ((alreadyScanned.status || '').startsWith('Alpa')) {
+        playErrorBeep();
+        setKioskLastScanned({
+          teacher,
+          time: alreadyScanned.jamDatang || '-',
+          status: alreadyScanned.status,
+          isDuplicate: true,
+          message: `Batas presensi ${teacher.nama} telah ditutup otomatis (${alreadyScanned.status}). Hubungi Admin atau Kurikulum jika ada tugas/izin.`
+        });
+        setKioskStatusMessage(`⛔ Batas Presensi Ditutup (${alreadyScanned.status}): ${teacher.nama}`);
+        return;
+      }
+
       playSuccessChime();
       setKioskLastScanned({
         teacher,
@@ -143,8 +180,9 @@ export const ScanPresensiView: React.FC<ScanPresensiViewProps> = ({
     const status: StatusPresensi = evalResult.status;
 
     const mapelToday = buildMapelString(teacher, hariIni, jadwalList);
+    const subNote = formatSubstituteAttendanceNote(teacher);
 
-    const keterangan = `${evalResult.keterangan} [Scan Kios Piket]`;
+    const keterangan = `${evalResult.keterangan}${subNote ? ' ' + subNote : ''} [Scan Kios Piket]`;
 
     const newLog: LogPresensi = {
       id: `LOG-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -317,8 +355,9 @@ export const ScanPresensiView: React.FC<ScanPresensiViewProps> = ({
           ======================================================== */}
       {(activeMode === 'hp_guru' || !isAdmin) && (
         <MobileSelfPresensi
-          masterList={masterList}
+          masterList={effectiveRoster}
           existingLogs={existingLogs}
+          cutiList={cutiList}
           settings={settings}
           isAdmin={isAdmin}
           selectedTeacherName={selectedTeacherName}
@@ -379,6 +418,10 @@ export const ScanPresensiView: React.FC<ScanPresensiViewProps> = ({
                 className={`bg-white rounded-2xl p-6 border-2 shadow-lg transition-all animate-scale-in text-center ${
                   kioskLastScanned.status === 'Tepat Waktu'
                     ? 'border-emerald-500 bg-emerald-50/20'
+                    : (kioskLastScanned.status || '').startsWith('Alpa')
+                    ? 'border-rose-500 bg-rose-50/20'
+                    : kioskLastScanned.status === 'Cuti'
+                    ? 'border-teal-500 bg-teal-50/20'
                     : 'border-amber-500 bg-amber-50/20'
                 }`}
               >
@@ -390,6 +433,10 @@ export const ScanPresensiView: React.FC<ScanPresensiViewProps> = ({
                   className={`inline-block px-3 py-1 rounded-full text-xs font-black uppercase tracking-wider mb-2 ${
                     kioskLastScanned.status === 'Tepat Waktu'
                       ? 'bg-emerald-500 text-white'
+                      : (kioskLastScanned.status || '').startsWith('Alpa')
+                      ? 'bg-rose-600 text-white'
+                      : kioskLastScanned.status === 'Cuti'
+                      ? 'bg-teal-600 text-white'
                       : 'bg-amber-500 text-white'
                   }`}
                 >
@@ -406,11 +453,23 @@ export const ScanPresensiView: React.FC<ScanPresensiViewProps> = ({
                 <div className="bg-white/80 border border-slate-200 rounded-xl p-3 text-xs space-y-1 max-w-xs mx-auto text-left">
                   <div className="flex justify-between">
                     <span className="text-slate-500">Jam Masuk:</span>
-                    <span className="font-extrabold text-slate-800">{kioskLastScanned.time} WIB</span>
+                    <span className="font-extrabold text-slate-800">
+                      {kioskLastScanned.time && kioskLastScanned.time !== '-' ? `${kioskLastScanned.time} WIB` : '-'}
+                    </span>
                   </div>
                   <div className="flex justify-between">
                     <span className="text-slate-500">Status:</span>
-                    <span className="font-bold text-emerald-700">{kioskLastScanned.status}</span>
+                    <span
+                      className={`font-bold ${
+                        (kioskLastScanned.status || '').startsWith('Alpa')
+                          ? 'text-rose-700'
+                          : kioskLastScanned.status === 'Cuti'
+                          ? 'text-teal-700'
+                          : 'text-emerald-700'
+                      }`}
+                    >
+                      {kioskLastScanned.status}
+                    </span>
                   </div>
                   <div className="flex justify-between border-t border-slate-100 pt-1 mt-1">
                     <span className="text-slate-500 shrink-0 mr-2">Jadwal Mengajar ({hariIni}):</span>
@@ -503,7 +562,7 @@ export const ScanPresensiView: React.FC<ScanPresensiViewProps> = ({
           MODE 3: GENERATOR & CETAK QR (KHUSUS ADMIN)
           ======================================================== */}
       {activeMode === 'cetak_qr' && isAdmin && (
-        <QrGeneratorPrintView masterList={masterList} settings={settings} />
+        <QrGeneratorPrintView masterList={effectiveRoster} settings={settings} />
       )}
 
       {/* ========================================================

@@ -1,6 +1,13 @@
-import { AttendanceRuleMode, DataCutiRecord, HariSekolah, JadwalSlot, LogPresensi, MasterGuruStaf } from '../types';
+import { AttendanceRuleMode, DataCutiRecord, HariSekolah, JadwalSlot, LogPresensi, MasterGuruStaf, SubstituteAssignment } from '../types';
 import { getHariFromDate, isJumat, formatLongDateIndonesian, formatTimestamp, getMapelHariIni } from './dateUtils';
-import { determineTeacherPeran, evaluateTeacherScheduleForDay, isTeacherWajibHadir } from './scheduleTimeEvaluator';
+import {
+  determineTeacherPeran,
+  evaluateTeacherScheduleForDay,
+  isTeacherWajibHadir,
+  ParsedSesiPelajaran,
+  TeacherDailyScheduleEvaluation
+} from './scheduleTimeEvaluator';
+import { cleanTeacherName } from './qrAndGeoUtils';
 
 export interface JenisCutiOption {
   id: string;
@@ -254,7 +261,9 @@ export function buildMissingDailyCutiLogs(params: {
 
   for (const rec of cutiRecords) {
     if (!rec.nama || !rec.tanggalMulai) continue;
-    if (String(rec.statusPengajuan || '').trim().toLowerCase() === 'dibatalkan') continue;
+    const statusNorm = String(rec.statusPengajuan || '').trim().toLowerCase();
+    if (statusNorm === 'dibatalkan') continue;
+    if (statusNorm === 'dicabut' && rec.jumlahHariEfektif === 0) continue;
 
     const endDate = rec.tanggalSelesai || rec.tanggalMulai;
     const range = enumerateSchoolDatesInRange(rec.tanggalMulai, endDate, 180);
@@ -322,3 +331,395 @@ export function buildMissingDailyCutiLogs(params: {
   return missingLogs;
 }
 
+/**
+ * Checks whether a DataCutiRecord is currently active on targetDateISO.
+ */
+export function isCutiRecordActiveOnDate(rec: DataCutiRecord, targetDateISO: string): boolean {
+  if (!rec || !rec.nama || !rec.tanggalMulai) return false;
+  const st = String(rec.statusPengajuan || 'Aktif').trim().toLowerCase();
+  if (st !== 'aktif' && st !== '') return false;
+  const end = (rec.tanggalSelesai || rec.tanggalMulai).trim();
+  return targetDateISO >= rec.tanggalMulai.trim() && targetDateISO <= end;
+}
+
+function isSameTeacherName(a: string, b: string): boolean {
+  const na = (a || '').trim().toLowerCase();
+  const nb = (b || '').trim().toLowerCase();
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const ca = cleanTeacherName(a);
+  const cb = cleanTeacherName(b);
+  return Boolean(ca && cb && ca === cb);
+}
+
+/**
+ * Finds an active Cuti record covering `nama` on `targetDateISO`.
+ * Falls back to `existingLogs` (`status === 'Cuti'`) if not explicitly ended/revoked in `cutiList`.
+ */
+export function findActiveCutiForTeacher(
+  nama: string,
+  targetDateISO: string,
+  cutiList: DataCutiRecord[] = [],
+  existingLogs: LogPresensi[] = []
+): DataCutiRecord | null {
+  if (!nama || !targetDateISO) return null;
+
+  const activeMatch = cutiList.find(
+    (c) => isSameTeacherName(c.nama, nama) && isCutiRecordActiveOnDate(c, targetDateISO)
+  );
+  if (activeMatch) return activeMatch;
+
+  // Check if explicitly revoked/ended covering this date so we don't resurrect it from stale logs
+  const explicitlyEnded = cutiList.some((c) => {
+    if (!isSameTeacherName(c.nama, nama)) return false;
+    const st = String(c.statusPengajuan || '').trim().toLowerCase();
+    if (st === 'aktif' || st === '') return false;
+    const end = (c.tanggalSelesai || c.tanggalMulai).trim();
+    return targetDateISO >= (c.tanggalMulai || '').trim() && targetDateISO <= end;
+  });
+  if (explicitlyEnded) return null;
+
+  const logCuti = existingLogs.find(
+    (l) => isSameTeacherName(l.nama, nama) && l.tanggal === targetDateISO && l.status === 'Cuti'
+  );
+  if (logCuti) {
+    const ket = (logCuti.keterangan || '').trim();
+    const jenisMatch = ket.match(/^\[([^\]]+)\]/);
+    const penggantiMatch = ket.match(/Pengganti\/Tugas:\s*([^•]+)/i);
+    const suratMatch = ket.match(/Surat:\s*([^•]+)/i);
+    return {
+      id: `LOG-CUTI-${logCuti.id}`,
+      waktuPengajuan: logCuti.timestamp || `${targetDateISO} 07:00:00`,
+      nama: logCuti.nama,
+      jabatan: logCuti.jabatan || '-',
+      peran: logCuti.peran || 'Guru',
+      jenisCuti: jenisMatch ? jenisMatch[1].trim() : 'Cuti',
+      tanggalMulai: targetDateISO,
+      tanggalSelesai: targetDateISO,
+      jumlahHariEfektif: 1,
+      cakupan: 'harian',
+      guruPengganti: penggantiMatch ? penggantiMatch[1].trim() : '-',
+      nomorSurat: suratMatch ? suratMatch[1].trim() : '-',
+      catatan: ket || '-',
+      statusPengajuan: 'Aktif'
+    };
+  }
+
+  return null;
+}
+
+export interface ParsedSubstituteEntry {
+  name: string;
+  masterTeacher?: MasterGuruStaf;
+  classNote?: string;
+}
+
+const NON_PERSON_REPLACEMENTS = /^(?:-|tugas\s*lks|lks|tugas\s*mandiri|mandiri|tugas\s*kelas|tidak\s*ada|belum\s*ada|tanpa\s*pengganti|kosong|none)$/i;
+
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function stripTrailingDegrees(name: string): string {
+  return name
+    .replace(/,\s*(?:S\.[A-Za-z.]+|M\.[A-Za-z.]+|A\.Md(?:\.[A-Za-z]+)?|Drs?\.?|Ph\.D|Lc\.?|SE|SH|SS|BA|MM)\b.*$/i, '')
+    .trim();
+}
+
+/**
+ * Parses `guruPengganti` strings safely without splitting on academic degrees (e.g. "NURUL QOMARIYAH, S.Pd"),
+ * while supporting multiple internal teachers with class notes ("ANISATUT TOYYIBAH KELAS 9, FATIMAH CITRA HANDAYANI KELAS 8")
+ * as well as external substitute names ("Muhammad Mustafa Wibisono").
+ */
+export function parseGuruPenggantiList(
+  rawPengganti: string,
+  masterList: MasterGuruStaf[]
+): ParsedSubstituteEntry[] {
+  const raw = (rawPengganti || '').trim();
+  if (!raw || NON_PERSON_REPLACEMENTS.test(raw)) return [];
+
+  const results: ParsedSubstituteEntry[] = [];
+  const seenKeys = new Set<string>();
+  let working = ` ${raw} `;
+
+  // 1. Match known teachers from Master_Guru_Staf longest-first
+  const sortedMasters = [...masterList].sort((a, b) => (b.nama || '').length - (a.nama || '').length);
+  for (const m of sortedMasters) {
+    if (!m.nama || !m.nama.trim()) continue;
+    const baseName = stripTrailingDegrees(m.nama);
+    const candidates = [m.nama.trim()];
+    if (baseName && baseName.length >= 4 && baseName.toLowerCase() !== m.nama.trim().toLowerCase()) {
+      candidates.push(baseName);
+    }
+
+    for (const cand of candidates) {
+      const pattern = new RegExp(
+        `(^|[^A-Za-z0-9])(${escapeRegExp(cand)})(?:\\s+(KELAS\\s+[0-9A-Za-z-]+(?:\\s*(?:&|dan|s\\/d|-)\\s*[0-9A-Za-z-]+)?))?(?=$|[^A-Za-z0-9])`,
+        'i'
+      );
+      const match = working.match(pattern);
+      if (match) {
+        const normKey = cleanTeacherName(m.nama) || m.nama.trim().toLowerCase();
+        if (!seenKeys.has(normKey)) {
+          seenKeys.add(normKey);
+          results.push({
+            name: m.nama,
+            masterTeacher: m,
+            classNote: match[3] ? match[3].trim() : undefined
+          });
+        }
+        working = working.replace(pattern, '$1 | ');
+        break;
+      }
+    }
+  }
+
+  // 2. Parse remaining external names cleanly (preserving ", S.Pd" / ", M.Pd" suffixes)
+  const segments = working
+    .split(/[;|/\n]+|,(?!\s*(?:S\.|M\.|Drs?\.?|H\.|Hj\.|A\.Md|Lc|Ph\.D|Pd|Ag|Kom|Mat|SE|SH|MM|BA|SS|Fil))/i)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  for (let seg of segments) {
+    // Extract optional inline "(KELAS ...)" or trailing "KELAS ..."
+    let classNote: string | undefined;
+    const kelasMatch = seg.match(/\b(KELAS\s+[0-9A-Za-z-]+(?:\s*(?:&|dan|s\/d|-)\s*[0-9A-Za-z-]+)?)\b/i);
+    if (kelasMatch) {
+      classNote = kelasMatch[1].trim();
+      seg = seg.replace(kelasMatch[0], '').trim();
+    }
+    seg = seg.replace(/^[\s,.\-–—•()]+|[\s,.\-–—•()]+$/g, '').trim();
+    if (!seg || seg.length < 3) continue;
+    if (NON_PERSON_REPLACEMENTS.test(seg)) continue;
+    if (/^(tugas|lks|mandiri|kelas\s*[0-9a-z-]*)$/i.test(seg)) continue;
+
+    // Double-check against masterList by cleanTeacherName
+    const cleanSeg = cleanTeacherName(seg);
+    const fallbackMaster = masterList.find((m) => cleanTeacherName(m.nama) === cleanSeg);
+    const key = cleanSeg || seg.toLowerCase();
+    if (!seenKeys.has(key)) {
+      seenKeys.add(key);
+      results.push({
+        name: fallbackMaster ? fallbackMaster.nama : seg,
+        masterTeacher: fallbackMaster,
+        classNote
+      });
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Builds an attendance roster for `targetDateISO`:
+ * - Clones permanent `masterList` and enriches internal substitutes with `substitutingFor` metadata
+ * - Dynamically appends virtual `MasterGuruStaf` entries (`isTempSubstitute: true`) for active external substitutes
+ *   so they can check in at Kios/HP/Input Presensi ONLY during the active Cuti range.
+ */
+export function buildEffectiveAttendanceRoster(
+  masterList: MasterGuruStaf[],
+  cutiList: DataCutiRecord[] = [],
+  targetDateISO: string,
+  _jadwalList?: JadwalSlot[]
+): MasterGuruStaf[] {
+  const cloned: MasterGuruStaf[] = masterList.map((m) => ({
+    ...m,
+    substitutingFor: m.substitutingFor ? [...m.substitutingFor] : undefined
+  }));
+
+  if (!cutiList || cutiList.length === 0 || !targetDateISO) {
+    return cloned;
+  }
+
+  const masterByKey = new Map<string, MasterGuruStaf>();
+  for (const m of cloned) {
+    const key = cleanTeacherName(m.nama) || m.nama.trim().toLowerCase();
+    masterByKey.set(key, m);
+  }
+
+  const tempSubsMap = new Map<string, MasterGuruStaf>();
+  let tempCounter = 1;
+
+  const activeCutis = cutiList.filter((rec) => isCutiRecordActiveOnDate(rec, targetDateISO));
+
+  for (const rec of activeCutis) {
+    const parsedSubs = parseGuruPenggantiList(rec.guruPengganti, cloned);
+    if (parsedSubs.length === 0) continue;
+
+    const guruCuti = masterByKey.get(cleanTeacherName(rec.nama) || rec.nama.trim().toLowerCase());
+
+    for (const sub of parsedSubs) {
+      const assignment: SubstituteAssignment = {
+        cutiId: rec.id,
+        guruCutiNama: rec.nama,
+        guruCutiJabatan: rec.jabatan,
+        jenisCuti: rec.jenisCuti,
+        tanggalMulai: rec.tanggalMulai,
+        tanggalSelesai: rec.tanggalSelesai || rec.tanggalMulai,
+        catatan: rec.catatan,
+        classNote: sub.classNote
+      };
+
+      const subKey = cleanTeacherName(sub.name) || sub.name.trim().toLowerCase();
+      const existingMaster = sub.masterTeacher
+        ? masterByKey.get(cleanTeacherName(sub.masterTeacher.nama) || sub.masterTeacher.nama.trim().toLowerCase())
+        : masterByKey.get(subKey);
+
+      if (existingMaster) {
+        if (!existingMaster.substitutingFor) existingMaster.substitutingFor = [];
+        const dup = existingMaster.substitutingFor.some((a) => a.cutiId === assignment.cutiId);
+        if (!dup) {
+          existingMaster.substitutingFor.push(assignment);
+        }
+      } else {
+        let tempEntry = tempSubsMap.get(subKey);
+        if (!tempEntry) {
+          const slug = sub.name
+            .trim()
+            .toUpperCase()
+            .replace(/[^A-Z0-9]+/g, '-')
+            .replace(/^-|-$/g, '')
+            .slice(0, 18);
+          tempEntry = {
+            no: 900 + tempCounter,
+            nama: sub.name,
+            jabatan: `Guru Pengganti Sementara (${rec.nama})`,
+            kodeUnik: `SUB-${String(tempCounter).padStart(2, '0')}-${slug || 'PENGGANTI'}`,
+            kodeGuru: guruCuti?.kodeGuru,
+            peran: 'Guru',
+            mapelSabtu: guruCuti?.mapelSabtu || '-',
+            mapelAhad: guruCuti?.mapelAhad || '-',
+            mapelSenin: guruCuti?.mapelSenin || '-',
+            mapelSelasa: guruCuti?.mapelSelasa || '-',
+            mapelRabu: guruCuti?.mapelRabu || '-',
+            mapelKamis: guruCuti?.mapelKamis || '-',
+            isTempSubstitute: true,
+            substitutingFor: [assignment]
+          };
+          tempCounter++;
+          tempSubsMap.set(subKey, tempEntry);
+        } else {
+          if (!tempEntry.substitutingFor) tempEntry.substitutingFor = [];
+          if (!tempEntry.substitutingFor.some((a) => a.cutiId === assignment.cutiId)) {
+            tempEntry.substitutingFor.push(assignment);
+            const names = tempEntry.substitutingFor.map((a) => a.guruCutiNama).join(', ');
+            tempEntry.jabatan = `Guru Pengganti Sementara (${names})`;
+          }
+        }
+      }
+    }
+  }
+
+  return [...cloned, ...Array.from(tempSubsMap.values())];
+}
+
+/**
+ * Formats substitute teacher context note for attendance logs (`keterangan`).
+ */
+export function formatSubstituteAttendanceNote(teacher?: MasterGuruStaf | null): string {
+  if (!teacher?.substitutingFor || teacher.substitutingFor.length === 0) return '';
+  const items = teacher.substitutingFor.map(
+    (s) => `${s.guruCutiNama}${s.classNote ? ` (${s.classNote})` : ''}`
+  );
+  return `[Pengganti Sementara: ${items.join(', ')}]`;
+}
+
+export interface SubstitutedScheduleGroup {
+  assignment: SubstituteAssignment;
+  guruCuti?: MasterGuruStaf;
+  scheduleEval: TeacherDailyScheduleEvaluation;
+  matchedSesiList: ParsedSesiPelajaran[];
+  isClassFiltered: boolean;
+}
+
+function normalizeClassTokensForMatch(raw: string): string[] {
+  return raw
+    .toUpperCase()
+    .replace(/\bVIII\b/g, '8')
+    .replace(/\bVII\b/g, '7')
+    .replace(/\bIX\b/g, '9')
+    .replace(/\bKELAS\b/g, ' ')
+    .split(/[\s,&;/|+-]+|\bDAN\b|\bS\/D\b/i)
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+function doesSesiMatchClassNote(sesiKelas: string, classNote?: string): boolean {
+  if (!classNote || !classNote.trim()) return true;
+  const noteTokens = normalizeClassTokensForMatch(classNote);
+  if (noteTokens.length === 0) return true;
+
+  const normKelas = (sesiKelas || '')
+    .toUpperCase()
+    .replace(/\bVIII\b/g, '8')
+    .replace(/\bVII\b/g, '7')
+    .replace(/\bIX\b/g, '9')
+    .replace(/\bKELAS\b/g, ' ')
+    .replace(/\s+/g, '');
+
+  if (!normKelas || normKelas === '-') return false;
+
+  return noteTokens.some((tok) => {
+    if (/^[789]$/.test(tok)) {
+      // Grade-only match (e.g. "9" matches "9A", "9B", "8A,9D")
+      return new RegExp(`(^|[^0-9])${tok}`).test(normKelas);
+    }
+    return normKelas.includes(tok);
+  });
+}
+
+/**
+ * Resolves the teaching schedule(s) of the teacher(s) on leave (`substitutingFor`) for a given school day.
+ * Supports both internal substitutes (who also have their own schedule) and external temporary substitutes.
+ */
+export function getSubstitutedSchedulesForDay(params: {
+  teacher?: MasterGuruStaf | null;
+  masterList: MasterGuruStaf[];
+  hari: HariSekolah;
+  threshold: string;
+  jadwalList?: JadwalSlot[];
+  attendanceRuleOverrides?: Record<string, AttendanceRuleMode>;
+}): SubstitutedScheduleGroup[] {
+  const { teacher, masterList, hari, threshold, jadwalList, attendanceRuleOverrides } = params;
+  if (!teacher?.substitutingFor || teacher.substitutingFor.length === 0) return [];
+
+  const groups: SubstitutedScheduleGroup[] = [];
+
+  for (const assignment of teacher.substitutingFor) {
+    const guruCuti = masterList.find(
+      (m) => !m.isTempSubstitute && isSameTeacherName(m.nama, assignment.guruCutiNama)
+    );
+    if (!guruCuti) continue;
+
+    const scheduleEval = evaluateTeacherScheduleForDay(
+      guruCuti,
+      hari,
+      threshold,
+      jadwalList,
+      attendanceRuleOverrides
+    );
+
+    let matchedSesiList = scheduleEval.sesiList;
+    let isClassFiltered = false;
+
+    if (assignment.classNote && scheduleEval.sesiList.length > 0) {
+      const filtered = scheduleEval.sesiList.filter((s) =>
+        doesSesiMatchClassNote(s.kelas, assignment.classNote)
+      );
+      if (filtered.length > 0) {
+        matchedSesiList = filtered;
+        isClassFiltered = filtered.length < scheduleEval.sesiList.length;
+      }
+    }
+
+    groups.push({
+      assignment,
+      guruCuti,
+      scheduleEval,
+      matchedSesiList,
+      isClassFiltered
+    });
+  }
+
+  return groups;
+}

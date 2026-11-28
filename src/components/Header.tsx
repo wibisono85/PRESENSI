@@ -13,7 +13,8 @@ import {
   Lock,
   ShieldCheck,
   QrCode,
-  BookOpen
+  BookOpen,
+  FileSignature
 } from 'lucide-react';
 import { ActiveTab, UserRole } from '../types';
 
@@ -77,7 +78,7 @@ export const Header: React.FC<HeaderProps> = ({
   }, [activeTab, isAuthorized]);
 
   return (
-    <header className="bg-[#2F5597] text-white shadow-md sticky top-0 z-30">
+    <header className="print:hidden bg-[#2F5597] text-white shadow-md sticky top-0 z-30">
       {/* Top Banner */}
       <div className="max-w-7xl mx-auto px-4 py-3 sm:px-6 flex flex-col sm:flex-row items-center justify-between gap-2">
         <div className="flex items-center gap-3">
@@ -204,6 +205,22 @@ export const Header: React.FC<HeaderProps> = ({
             >
               <BookOpen className="w-4 h-4 text-emerald-300" />
               <span>Jadwal Pelajaran (16 Kelas)</span>
+            </button>
+
+            {/* Tab: Pembinaan & Surat Peringatan (SP) - Akses Admin & Kurikulum */}
+            <button
+              id="tab-sp-pembinaan"
+              data-tab="sp_pembinaan"
+              data-active={activeTab === 'sp_pembinaan'}
+              onClick={() => setActiveTab('sp_pembinaan')}
+              className={`flex items-center gap-2 px-3.5 py-2.5 text-xs sm:text-sm font-medium border-b-2 whitespace-nowrap transition-all ${
+                activeTab === 'sp_pembinaan'
+                  ? 'border-yellow-400 text-yellow-300 bg-white/10 shadow-sm'
+                  : 'border-transparent text-blue-100 hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <FileSignature className="w-4 h-4 text-rose-300" />
+              <span>Pembinaan &amp; SP</span>
             </button>
 
             {/* Admin-Only Tabs: Presensi, Input, Rekap, Master, Pengaturan, Diagnostik */}

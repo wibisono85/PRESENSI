@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { APPS_SCRIPT_CODE } from '../utils/googleAppsScript';
+import { APPS_SCRIPT_CODE, DEFAULT_WHATSAPP_GROUP_URL, WaGatewayStatus } from '../utils/googleAppsScript';
 import { DEFAULT_SCHOOL_COORDS } from '../utils/qrAndGeoUtils';
 import { resolveTeacherAttendanceRule } from '../utils/scheduleTimeEvaluator';
 import { AppSettings, AttendanceRuleMode, JadwalSlot, MasterGuruStaf } from '../types';
@@ -23,7 +23,9 @@ import {
   Lock,
   Users,
   Search,
-  RotateCcw
+  RotateCcw,
+  BellRing,
+  Send
 } from 'lucide-react';
 
 interface AppsScriptSetupProps {
@@ -31,6 +33,8 @@ interface AppsScriptSetupProps {
   onSaveSettings: (newSettings: Partial<AppSettings>) => void;
   onTestConnection: () => Promise<void>;
   onSeedMasterData: () => Promise<{ success: boolean; message: string }>;
+  onTestWaReminder?: () => Promise<{ success: boolean; sent: boolean; message: string }>;
+  waGatewayStatus?: WaGatewayStatus;
   masterCount: number;
   masterList?: MasterGuruStaf[];
   jadwalList?: JadwalSlot[];
@@ -41,6 +45,8 @@ export const AppsScriptSetup: React.FC<AppsScriptSetupProps> = ({
   onSaveSettings,
   onTestConnection,
   onSeedMasterData,
+  onTestWaReminder,
+  waGatewayStatus,
   masterCount,
   masterList = [],
   jadwalList
@@ -81,6 +87,30 @@ export const AppsScriptSetup: React.FC<AppsScriptSetupProps> = ({
   const [quotaAlpa, setQuotaAlpa] = useState<number>(settings.quotaAlpa ?? 1);
   const [quotaDinasLuar, setQuotaDinasLuar] = useState<number>(settings.quotaDinasLuar ?? 5);
   const [quotaTanggalMulai, setQuotaTanggalMulai] = useState<string>(settings.quotaTanggalMulai || `${new Date().getFullYear()}-07-01`);
+  const [whatsappGroupUrl, setWhatsappGroupUrl] = useState<string>(settings.whatsappGroupUrl || DEFAULT_WHATSAPP_GROUP_URL);
+  const [waReminderEnabled, setWaReminderEnabled] = useState<boolean>(settings.waReminderEnabled !== false);
+  const [waReminderJam, setWaReminderJam] = useState<string>(settings.waReminderJam || '08:30');
+  const [waGatewayProvider, setWaGatewayProvider] = useState<'fonnte' | 'wablas' | 'webhook'>(
+    settings.waGatewayProvider || 'fonnte'
+  );
+  const [waGatewayUrl, setWaGatewayUrl] = useState<string>(settings.waGatewayUrl || '');
+  const [waGroupId, setWaGroupId] = useState<string>(settings.waGroupId || '');
+  const [waAppPublicUrl, setWaAppPublicUrl] = useState<string>(
+    settings.waAppPublicUrl || (typeof window !== 'undefined' ? `${window.location.origin}${window.location.pathname}` : '')
+  );
+  const [isTestingWa, setIsTestingWa] = useState<boolean>(false);
+  const [waTestResult, setWaTestResult] = useState<{ success: boolean; message: string } | null>(null);
+
+  // Auto-Alpa Settings state
+  const [autoAlpaEnabled, setAutoAlpaEnabled] = useState<boolean>(settings.autoAlpaEnabled !== false);
+  const [autoAlpaGraceMenit, setAutoAlpaGraceMenit] = useState<number>(settings.autoAlpaGraceMenit ?? 90);
+  const [autoAlpaCutoffMode, setAutoAlpaCutoffMode] = useState<'setelah_jam_masuk' | 'batas_akhir_tetap'>(
+    settings.autoAlpaCutoffMode || 'setelah_jam_masuk'
+  );
+  const [autoAlpaBatasAkhirJam, setAutoAlpaBatasAkhirJam] = useState<string>(settings.autoAlpaBatasAkhirJam || '09:00');
+  const [autoAlpaMulaiTanggal, setAutoAlpaMulaiTanggal] = useState<string>(
+    settings.autoAlpaMulaiTanggal || `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}-${String(new Date().getDate()).padStart(2, '0')}`
+  );
 
   const [copied, setCopied] = useState<boolean>(false);
   const [isTesting, setIsTesting] = useState<boolean>(false);
@@ -143,11 +173,23 @@ export const AppsScriptSetup: React.FC<AppsScriptSetupProps> = ({
         quotaSakit: Number(quotaSakit),
         quotaAlpa: Number(quotaAlpa),
         quotaDinasLuar: Number(quotaDinasLuar),
-        quotaTanggalMulai
+        quotaTanggalMulai,
+        autoAlpaEnabled,
+        autoAlpaGraceMenit: Math.max(15, Number(autoAlpaGraceMenit) || 90),
+        autoAlpaCutoffMode,
+        autoAlpaBatasAkhirJam: autoAlpaBatasAkhirJam.trim() || '09:00',
+        autoAlpaMulaiTanggal: autoAlpaMulaiTanggal.trim(),
+        whatsappGroupUrl: whatsappGroupUrl.trim() || DEFAULT_WHATSAPP_GROUP_URL,
+        waReminderEnabled,
+        waReminderJam: waReminderJam.trim() || '08:30',
+        waGatewayProvider,
+        waGatewayUrl: waGatewayUrl.trim(),
+        waGroupId: waGroupId.trim(),
+        waAppPublicUrl: waAppPublicUrl.trim()
       });
       setTestResult({
         success: true,
-        message: 'Pengaturan, Titik GPS Sekolah, Kebijakan Kehadiran, dan Kuota berhasil tersimpan & tersinkronisasi ke Google Sheets!'
+        message: 'Pengaturan, Titik GPS Sekolah, Kebijakan Kehadiran, Kuota, dan Pengingat WA berhasil tersimpan & tersinkronisasi ke Google Sheets!'
       });
     } catch (err: any) {
       setTestResult({
@@ -582,6 +624,102 @@ export const AppsScriptSetup: React.FC<AppsScriptSetupProps> = ({
             </div>
           )}
 
+          {/* Auto-Alpa (Pencatatan Otomatis Tidak Hadir +90 Menit) */}
+          <div className="p-4 bg-rose-50/50 rounded-xl border border-rose-200 space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-start gap-2.5">
+                <Clock className="w-4 h-4 text-rose-700 shrink-0 mt-0.5" />
+                <div>
+                  <h4 className="text-xs sm:text-sm font-bold text-slate-900">
+                    Pencatatan Otomatis &ldquo;Tidak Hadir / Alpa&rdquo; (Maks. 90 Menit Setelah Jam Masuk)
+                  </h4>
+                  <p className="text-[11px] text-slate-600 leading-relaxed mt-0.5">
+                    Guru atau staf yang berstatus <strong>Wajib Hadir</strong> (memiliki jadwal mengajar / tugas harian) namun tidak mengisi presensi hingga batas waktu maksimal akan <strong>diisi otomatis sebagai Alpa / Tidak Hadir</strong> oleh sistem (tidak berlaku bagi yang sedang Cuti/Izin/Sakit/Dinas Luar atau tidak ada jadwal).
+                  </p>
+                </div>
+              </div>
+              <label className="inline-flex items-center gap-2 cursor-pointer shrink-0 bg-white px-3 py-1.5 rounded-lg border border-rose-200 text-xs font-bold text-slate-800">
+                <input
+                  type="checkbox"
+                  checked={autoAlpaEnabled}
+                  onChange={(e) => setAutoAlpaEnabled(e.target.checked)}
+                  className="w-4 h-4 text-rose-600 rounded focus:ring-rose-500"
+                />
+                <span>{autoAlpaEnabled ? 'Aktif' : 'Nonaktif'}</span>
+              </label>
+            </div>
+
+            {autoAlpaEnabled && (
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 bg-white p-3.5 rounded-xl border border-rose-100">
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    Mode Batas Waktu Otomatis
+                  </label>
+                  <select
+                    value={autoAlpaCutoffMode}
+                    onChange={(e) => setAutoAlpaCutoffMode(e.target.value as 'setelah_jam_masuk' | 'batas_akhir_tetap')}
+                    className="w-full px-2.5 py-2 bg-slate-50 border border-slate-300 rounded-lg text-xs font-bold text-slate-800"
+                  >
+                    <option value="setelah_jam_masuk">Setelah Jam Masuk Masing-masing (+Menit)</option>
+                    <option value="batas_akhir_tetap">Batas Akhir Kedatangan Tetap (WIB)</option>
+                  </select>
+                </div>
+
+                {autoAlpaCutoffMode === 'setelah_jam_masuk' ? (
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                      Toleransi Maksimal (Menit)
+                    </label>
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        type="number"
+                        min={15}
+                        max={240}
+                        value={autoAlpaGraceMenit}
+                        onChange={(e) => setAutoAlpaGraceMenit(parseInt(e.target.value, 10) || 90)}
+                        className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-xs font-bold text-slate-800 text-center"
+                      />
+                      <span className="text-xs font-bold text-slate-600 shrink-0">menit</span>
+                    </div>
+                    <p className="text-[10.5px] text-slate-500 mt-1">
+                      Default 90 mnt (mis. {threshold || '07:25'} &rarr; tutup 08:55; Jam 08:30 &rarr; tutup 10:00).
+                    </p>
+                  </div>
+                ) : (
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                      Jam Batas Akhir Kedatangan
+                    </label>
+                    <input
+                      type="time"
+                      value={autoAlpaBatasAkhirJam}
+                      onChange={(e) => setAutoAlpaBatasAkhirJam(e.target.value)}
+                      className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-xs font-bold text-slate-800"
+                    />
+                    <p className="text-[10.5px] text-slate-500 mt-1">
+                      Guru yang jam mengajarnya lebih siang tetap diberi jeda +{autoAlpaGraceMenit} mnt dari jadwalnya.
+                    </p>
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    Mulai Berlaku Sejak Tanggal
+                  </label>
+                  <input
+                    type="date"
+                    value={autoAlpaMulaiTanggal}
+                    onChange={(e) => setAutoAlpaMulaiTanggal(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-xs font-bold text-slate-800"
+                  />
+                  <p className="text-[10.5px] text-slate-500 mt-1">
+                    Hari sekolah sebelum tanggal ini tidak akan diisi otomatis secara surut.
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+
           {/* Quota Settings Section */}
           <div className="pt-4 border-t border-slate-100 space-y-4">
             <div className="flex items-center gap-2">
@@ -693,6 +831,178 @@ export const AppsScriptSetup: React.FC<AppsScriptSetupProps> = ({
                   <span className="text-xs font-semibold text-slate-600 shrink-0">kali</span>
                 </div>
               </div>
+            </div>
+
+            <div className="p-4 bg-emerald-50/60 rounded-xl border border-emerald-200 space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-2">
+                <div className="flex items-start gap-2">
+                  <BellRing className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />
+                  <div>
+                    <h4 className="text-xs sm:text-sm font-bold text-emerald-950">
+                      Grup WhatsApp Resmi &amp; Pengingat Otomatis Pukul 08:30 WIB
+                    </h4>
+                    <p className="text-[11px] text-emerald-900 leading-relaxed mt-0.5">
+                      Link undangan grup WA dipakai guru/staf untuk melapor Izin/Sakit/Dinas dari rumah dan oleh Admin di tab <strong>Belum Absen</strong>. Untuk kirim <strong>100% otomatis setiap pukul 08:30 WIB tanpa membuka aplikasi</strong>, Apps Script memerlukan WA Gateway (Fonnte / Wablas / Webhook).
+                    </p>
+                  </div>
+                </div>
+                <label className="inline-flex items-center gap-2 cursor-pointer shrink-0 bg-white px-3 py-1.5 rounded-lg border border-emerald-300 text-xs font-bold text-emerald-950">
+                  <input
+                    type="checkbox"
+                    checked={waReminderEnabled}
+                    onChange={(e) => setWaReminderEnabled(e.target.checked)}
+                    className="w-4 h-4 text-emerald-600 rounded focus:ring-emerald-500"
+                  />
+                  <span>{waReminderEnabled ? 'Pengingat 08:30 Aktif' : 'Nonaktif'}</span>
+                </label>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-emerald-950 mb-1">
+                  Link Undangan Grup WhatsApp Resmi Sekolah
+                </label>
+                <input
+                  type="url"
+                  value={whatsappGroupUrl}
+                  onChange={(e) => setWhatsappGroupUrl(e.target.value)}
+                  placeholder={DEFAULT_WHATSAPP_GROUP_URL}
+                  className="w-full px-3 py-2 bg-white border border-emerald-300 rounded-lg text-xs font-mono text-slate-800 focus:ring-2 focus:ring-emerald-600"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 bg-white p-3.5 rounded-xl border border-emerald-200/80">
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    Jam Kirim Pengingat Harian
+                  </label>
+                  <input
+                    type="time"
+                    value={waReminderJam}
+                    onChange={(e) => setWaReminderJam(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-xs font-bold text-slate-800"
+                  />
+                  <p className="text-[10.5px] text-slate-500 mt-1">
+                    Default: 08:30 WIB (sebelum batas Auto-Alpa 08:55 / 09:00).
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    Provider WA Gateway (Server)
+                  </label>
+                  <select
+                    value={waGatewayProvider}
+                    onChange={(e) => setWaGatewayProvider(e.target.value as 'fonnte' | 'wablas' | 'webhook')}
+                    className="w-full px-2.5 py-2 bg-slate-50 border border-slate-300 rounded-lg text-xs font-bold text-slate-800"
+                  >
+                    <option value="fonnte">Fonnte (api.fonnte.com)</option>
+                    <option value="wablas">Wablas (isGroup API)</option>
+                    <option value="webhook">Custom Webhook (n8n / Make / Bot)</option>
+                  </select>
+                  <p className="text-[10.5px] text-slate-500 mt-1">
+                    Token API disimpan aman di Script Properties Apps Script (<code className="bg-slate-100 px-1 rounded">WA_GATEWAY_TOKEN</code>).
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    ID Grup WA Tujuan (<code className="font-mono">...@g.us</code>)
+                  </label>
+                  <input
+                    type="text"
+                    value={waGroupId}
+                    onChange={(e) => setWaGroupId(e.target.value)}
+                    placeholder="Contoh: 120363123456789@g.us"
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-800"
+                  />
+                  <p className="text-[10.5px] text-slate-500 mt-1">
+                    Didapat dari menu Daftar Grup di dashboard Fonnte / Wablas.
+                  </p>
+                </div>
+
+                <div className="sm:col-span-2">
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    URL Endpoint Gateway {waGatewayProvider === 'fonnte' ? '(Opsional, bawaan: https://api.fonnte.com/send)' : '(Wajib untuk Wablas / Webhook)'}
+                  </label>
+                  <input
+                    type="url"
+                    value={waGatewayUrl}
+                    onChange={(e) => setWaGatewayUrl(e.target.value)}
+                    placeholder={
+                      waGatewayProvider === 'fonnte'
+                        ? 'https://api.fonnte.com/send'
+                        : waGatewayProvider === 'wablas'
+                        ? 'https://pati.wablas.com/api/send-message'
+                        : 'https://hook.domainanda.com/wa-presensi'
+                    }
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-800"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    Link Aplikasi dalam Pesan WA
+                  </label>
+                  <input
+                    type="url"
+                    value={waAppPublicUrl}
+                    onChange={(e) => setWaAppPublicUrl(e.target.value)}
+                    placeholder="https://username.github.io/presensi/"
+                    className="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono text-slate-800"
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-white/90 p-3 rounded-xl border border-emerald-200 text-[11px]">
+                <div className="space-y-0.5 text-slate-700">
+                  <div>
+                    Status Gateway Server:{' '}
+                    <strong className={waGatewayStatus?.configured ? 'text-emerald-700' : 'text-amber-700'}>
+                      {waGatewayStatus?.configured
+                        ? `Terhubung (${(waGatewayStatus.provider || waGatewayProvider).toUpperCase()})`
+                        : 'Belum Lengkap — Tambahkan WA_GATEWAY_TOKEN di Script Properties Apps Script'}
+                    </strong>
+                  </div>
+                  {waGatewayStatus?.lastStatus && (
+                    <div className="text-[10.5px] text-slate-500">
+                      Riwayat terakhir ({waGatewayStatus.lastSentDate || '-'}): {waGatewayStatus.lastStatus}
+                    </div>
+                  )}
+                </div>
+
+                {onTestWaReminder && (
+                  <button
+                    type="button"
+                    disabled={isTestingWa}
+                    onClick={async () => {
+                      setIsTestingWa(true);
+                      setWaTestResult(null);
+                      try {
+                        const res = await onTestWaReminder();
+                        setWaTestResult({ success: res.success && res.sent, message: res.message });
+                      } finally {
+                        setIsTestingWa(false);
+                      }
+                    }}
+                    className="px-3 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 shrink-0 transition cursor-pointer"
+                  >
+                    <Send className="w-3.5 h-3.5" />
+                    <span>{isTestingWa ? 'Menguji Kirim...' : 'Uji Kirim Pengingat Sekarang'}</span>
+                  </button>
+                )}
+              </div>
+
+              {waTestResult && (
+                <div
+                  className={`p-2.5 rounded-xl text-xs font-semibold border ${
+                    waTestResult.success
+                      ? 'bg-white border-emerald-300 text-emerald-900'
+                      : 'bg-amber-50 border-amber-300 text-amber-950'
+                  }`}
+                >
+                  {waTestResult.message}
+                </div>
+              )}
             </div>
           </div>
 
@@ -955,8 +1265,13 @@ export const AppsScriptSetup: React.FC<AppsScriptSetupProps> = ({
                 <li>Jalankan sebagai: <span className="font-bold text-slate-900">Saya (Me / email anda)</span></li>
                 <li>Siapa yang memiliki akses: <span className="font-bold text-emerald-700">Siapa saja (Anyone)</span> &larr; <span className="italic">PENTING agar tidak butuh login!</span></li>
               </ul>
-              <div className="mt-2.5 p-2.5 bg-amber-50 border border-amber-300 rounded-lg text-xs text-amber-900 leading-relaxed">
-                <strong>⚠️ Update Skrip yang Sudah Ada:</strong> Jika Anda memperbarui skrip yang sudah terpasang sebelumnya, wajib salin ulang kode di atas dan lakukan deploy ulang: <strong>Deploy &gt; Manage deployments &gt; Edit (ikon pensil) &gt; Versi: New version &gt; Deploy</strong> agar tab baru (seperti <code className="font-mono font-bold">Data_Cuti</code>) serta penyimpanan massal cepat aktif otomatis.
+              <div className="mt-2.5 p-2.5 bg-amber-50 border border-amber-300 rounded-lg text-xs text-amber-900 leading-relaxed space-y-1">
+                <p>
+                  <strong>⚠️ Update Skrip yang Sudah Ada:</strong> Jika Anda memperbarui skrip yang sudah terpasang sebelumnya, wajib salin ulang kode di atas dan lakukan deploy ulang: <strong>Deploy &gt; Manage deployments &gt; Edit (ikon pensil) &gt; Versi: New version &gt; Deploy</strong> agar tab baru (<code className="font-mono font-bold">Data_Cuti</code>, <code className="font-mono font-bold">Data_SP</code>) dan pencatatan Auto-Alpa aktif optimal.
+                </p>
+                <p>
+                  <strong>⏱️ Trigger Otomatis 24 Jam di Google Sheets:</strong> Di editor Apps Script, jalankan fungsi <code className="font-mono font-bold bg-amber-100 px-1 rounded">pasangTriggerAutoAlpaOtomatis</code> (1 kali) untuk pencatatan Tidak Hadir (+90 mnt), dan jalankan fungsi <code className="font-mono font-bold bg-emerald-100 text-emerald-900 px-1 rounded">pasangTriggerPengingatWa0830</code> (1 kali) agar sistem otomatis mengirim pengingat ke Grup WA setiap pukul <strong>08:30 WIB</strong> meski aplikasi web tidak dibuka.
+                </p>
               </div>
             </div>
           </div>
@@ -966,16 +1281,18 @@ export const AppsScriptSetup: React.FC<AppsScriptSetupProps> = ({
               5
             </span>
             <div>
-              <div className="font-bold text-slate-900">Atur PIN Server di Script Properties (Wajib)</div>
+              <div className="font-bold text-slate-900">Atur PIN Server &amp; Token WA Gateway di Script Properties</div>
               <p className="text-slate-600 mt-0.5 leading-relaxed">
                 Di editor Apps Script, klik ikon <span className="font-semibold">Gerigi (Project Settings / Setelan Proyek)</span> di menu sisi kiri. Gulir ke bagian bawah ke tabel <span className="font-semibold">Script Properties (Properti Skrip)</span>, klik <span className="font-semibold">"Add script property"</span> dan masukkan:
               </p>
               <ul className="list-disc list-inside mt-1.5 space-y-1 text-slate-700 font-mono text-xs">
-                <li><span className="font-bold text-[#2F5597]">PIN_ADMIN</span> : Masukkan PIN rahasia Admin (contoh: <code>1234</code>)</li>
-                <li><span className="font-bold text-[#2F5597]">PIN_KURIKULUM</span> : Masukkan PIN rahasia Kurikulum (contoh: <code>5678</code>)</li>
+                <li><span className="font-bold text-[#2F5597]">PIN_ADMIN</span> : PIN rahasia Admin (contoh: <code>1234</code>)</li>
+                <li><span className="font-bold text-[#2F5597]">PIN_KURIKULUM</span> : PIN rahasia Kurikulum (contoh: <code>5678</code>)</li>
+                <li><span className="font-bold text-emerald-700">WA_GATEWAY_TOKEN</span> : <em>(Opsional untuk kirim otomatis 08:30 WIB)</em> Token API dari Fonnte / Wablas / Webhook</li>
+                <li><span className="font-bold text-emerald-700">WA_GROUP_ID</span> : <em>(Boleh diisi di form atas atau di sini)</em> ID Grup WA (mis. <code>120363xxx@g.us</code>)</li>
               </ul>
               <p className="text-slate-600 mt-1 text-[11px]">
-                Lalu klik <strong>Save script properties</strong>. PIN ini aman di server Google dan tidak dapat dilihat oleh pengguna biasa.
+                Lalu klik <strong>Save script properties</strong>. PIN dan Token WA aman di server Google dan tidak pernah disimpan di browser atau GitHub.
               </p>
             </div>
           </div>

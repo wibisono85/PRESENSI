@@ -20,8 +20,11 @@ import {
 import {
   JENIS_CUTI_OPTIONS,
   addCalendarDaysISO,
+  buildEffectiveAttendanceRoster,
   enumerateSchoolDatesInRange,
-  formatCutiKeterangan
+  findActiveCutiForTeacher,
+  formatCutiKeterangan,
+  formatSubstituteAttendanceNote
 } from '../utils/cutiUtils';
 import { deriveCutiFromLogs } from '../utils/googleAppsScript';
 import { Time24hInput } from './Time24hInput';
@@ -43,7 +46,10 @@ import {
   Database,
   Trash2,
   ExternalLink,
-  RefreshCw
+  RefreshCw,
+  RotateCcw,
+  CalendarPlus,
+  UserPlus
 } from 'lucide-react';
 
 type InputMode = 'quick' | 'manual' | 'cuti';
@@ -65,6 +71,17 @@ interface InputPresensiProps {
     record: DataCutiRecord,
     alsoDeleteLogs?: boolean
   ) => Promise<{ success: boolean; message: string }>;
+  onRevokeCuti?: (
+    record: DataCutiRecord,
+    effectiveReturnDate: string
+  ) => Promise<{ success: boolean; syncedToSheet?: boolean; deletedLogCount?: number; message: string }>;
+  onExtendCuti?: (params: {
+    record: DataCutiRecord;
+    newEndDate: string;
+    guruPengganti?: string;
+    nomorSurat?: string;
+    catatan?: string;
+  }) => Promise<{ success: boolean; syncedToSheet?: boolean; addedLogs?: number; message: string }>;
   onSyncAllCuti?: (
     records: DataCutiRecord[]
   ) => Promise<{ success: boolean; syncedToSheet: boolean; needsScriptUpdate?: boolean; message: string }>;
@@ -86,6 +103,8 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
   onBatchSave,
   onSaveCuti,
   onDeleteCuti,
+  onRevokeCuti,
+  onExtendCuti,
   onSyncAllCuti,
   onNavigateToSetup,
   preselectedTeacher,
@@ -112,6 +131,7 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
   const [cutiStartDate, setCutiStartDate] = useState<string>(formatDateISO());
   const [cutiEndDate, setCutiEndDate] = useState<string>(formatDateISO());
   const [cutiGuruPengganti, setCutiGuruPengganti] = useState<string>('');
+  const [cutiPenggantiPicker, setCutiPenggantiPicker] = useState<string>('');
   const [cutiNomorSurat, setCutiNomorSurat] = useState<string>('');
   const [cutiCatatan, setCutiCatatan] = useState<string>('');
   const [cutiScope, setCutiScope] = useState<'wajib_hadir' | 'semua_hari_sekolah'>('wajib_hadir');
@@ -125,6 +145,17 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
   const [confirmDeleteCutiId, setConfirmDeleteCutiId] = useState<string | null>(null);
   const [deletingCutiId, setDeletingCutiId] = useState<string | null>(null);
   const [needsScriptUpdateNotice, setNeedsScriptUpdateNotice] = useState<boolean>(false);
+
+  // Revoke / Extend Cuti UI state
+  const [revokingCutiId, setRevokingCutiId] = useState<string | null>(null);
+  const [revokeReturnDate, setRevokeReturnDate] = useState<string>(formatDateISO());
+  const [isRevokingCuti, setIsRevokingCuti] = useState<boolean>(false);
+  const [extendingCutiId, setExtendingCutiId] = useState<string | null>(null);
+  const [extendEndDate, setExtendEndDate] = useState<string>('');
+  const [extendPengganti, setExtendPengganti] = useState<string>('');
+  const [extendNomorSurat, setExtendNomorSurat] = useState<string>('');
+  const [extendCatatan, setExtendCatatan] = useState<string>('');
+  const [isExtendingCuti, setIsExtendingCuti] = useState<boolean>(false);
 
   // Sync if preselectedTeacher or initialMode prop changes
   React.useEffect(() => {
@@ -145,17 +176,31 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
     return getHariFromDate(selectedTanggal);
   }, [selectedTanggal]);
 
-  // Teachers filtered according to schedule on active Hari (in Cuti mode, always allow picking any registered teacher/staff)
+  // Effective roster for Quick/Manual (includes temporary external substitutes active on selectedTanggal)
+  const effectiveRoster = useMemo(() => {
+    return buildEffectiveAttendanceRoster(masterList, cutiList, selectedTanggal, jadwalList);
+  }, [masterList, cutiList, selectedTanggal, jadwalList]);
+
+  // Teachers filtered according to schedule on active Hari (in Cuti mode, always allow picking any permanent teacher/staff)
   const baseTeachersOnDay = useMemo(() => {
-    if (inputMode === 'cuti' || showAllTeachers) return masterList;
-    return masterList.filter((m) =>
-      isTeacherWajibHadir(m, activeHari, jadwalList, settings?.guruTanpaJadwalWajibHadir, settings?.attendanceRuleOverrides)
+    if (inputMode === 'cuti') return masterList;
+    if (showAllTeachers) return effectiveRoster;
+    return effectiveRoster.filter(
+      (m) =>
+        m.isTempSubstitute ||
+        isTeacherWajibHadir(m, activeHari, jadwalList, settings?.guruTanpaJadwalWajibHadir, settings?.attendanceRuleOverrides)
     );
-  }, [masterList, activeHari, showAllTeachers, jadwalList, settings, inputMode]);
+  }, [masterList, effectiveRoster, activeHari, showAllTeachers, jadwalList, settings, inputMode]);
 
   const selectedPersonData = useMemo(() => {
-    return masterList.find((m) => m.nama === selectedNama) || null;
-  }, [masterList, selectedNama]);
+    const source = inputMode === 'cuti' ? masterList : effectiveRoster;
+    return source.find((m) => m.nama === selectedNama) || null;
+  }, [masterList, effectiveRoster, selectedNama, inputMode]);
+
+  const activeCutiForSelected = useMemo(() => {
+    if (!selectedPersonData || inputMode === 'cuti') return null;
+    return findActiveCutiForTeacher(selectedPersonData.nama, selectedTanggal, cutiList, existingLogs);
+  }, [selectedPersonData, inputMode, selectedTanggal, cutiList, existingLogs]);
 
   const scheduleEvalResult = useMemo(() => {
     if (!selectedPersonData) return null;
@@ -429,6 +474,14 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
     }
 
     const now = new Date();
+    const subNote = !isManualAbsence ? formatSubstituteAttendanceNote(selectedPersonData) : '';
+    const rawKet = ket.trim();
+    const finalKetSaved = subNote
+      ? rawKet
+        ? `${rawKet} ${subNote}`
+        : subNote
+      : rawKet;
+
     const newLog: LogPresensi = {
       id: `LOG-${Date.now()}`,
       timestamp: formatTimestamp(now),
@@ -439,7 +492,7 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
       mapelHariIni: mapelHariIni,
       jamDatang: isManualAbsence ? '-' : jam,
       status: status,
-      keterangan: ket.trim(),
+      keterangan: finalKetSaved,
       peran: peranVal,
       batasStaf: batasStafVal,
       statusStaf: statusStafVal,
@@ -640,6 +693,50 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
       type: res.success ? 'success' : 'error',
       text: res.message
     });
+  };
+
+  const handleConfirmRevokeCuti = async (rec: DataCutiRecord, returnDate: string) => {
+    if (!onRevokeCuti) return;
+    setIsRevokingCuti(true);
+    const res = await onRevokeCuti(rec, returnDate);
+    setIsRevokingCuti(false);
+    setRevokingCutiId(null);
+    setDuplicateWarning(null);
+    setToastMessage({
+      type: res.success ? 'success' : 'error',
+      text: res.message
+    });
+  };
+
+  const handleConfirmExtendCuti = async (rec: DataCutiRecord) => {
+    if (!onExtendCuti) return;
+    setIsExtendingCuti(true);
+    const res = await onExtendCuti({
+      record: rec,
+      newEndDate: extendEndDate,
+      guruPengganti: extendPengganti,
+      nomorSurat: extendNomorSurat,
+      catatan: extendCatatan
+    });
+    setIsExtendingCuti(false);
+    setExtendingCutiId(null);
+    setToastMessage({
+      type: res.success ? 'success' : 'error',
+      text: res.message
+    });
+  };
+
+  const handleAddInternalSubstitute = () => {
+    if (!cutiPenggantiPicker) return;
+    const current = cutiGuruPengganti.trim();
+    const parts = current
+      ? current.split(/[;|]/).map((s) => s.trim()).filter(Boolean)
+      : [];
+    if (!parts.some((p) => p.toLowerCase() === cutiPenggantiPicker.toLowerCase())) {
+      parts.push(cutiPenggantiPicker);
+    }
+    setCutiGuruPengganti(parts.join('; '));
+    setCutiPenggantiPicker('');
   };
 
   return (
@@ -899,11 +996,18 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
             className="w-full px-4 py-3 bg-slate-50 border border-slate-300 rounded-xl text-sm sm:text-base text-slate-800 font-semibold focus:ring-2 focus:ring-[#2F5597] focus:outline-none disabled:opacity-50"
           >
             <option value="">-- Pilih Guru atau Staf --</option>
-            {filteredMasterList.map((m, idx) => (
-              <option key={`presensi-teacher-${m.no}-${m.nama}-${idx}`} value={m.nama}>
-                {m.nama} ({m.jabatan})
-              </option>
-            ))}
+            {filteredMasterList.map((m, idx) => {
+              const subSuffix = m.isTempSubstitute
+                ? ' [Pengganti Sementara]'
+                : m.substitutingFor && m.substitutingFor.length > 0
+                ? ` (+Pengganti: ${m.substitutingFor.map((s) => s.guruCutiNama).join(', ')})`
+                : '';
+              return (
+                <option key={`presensi-teacher-${m.no}-${m.nama}-${idx}`} value={m.nama}>
+                  {m.nama} ({m.jabatan}){subSuffix}
+                </option>
+              );
+            })}
           </select>
         </div>
 
@@ -917,9 +1021,25 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
                 <span className="text-sm font-bold text-slate-800">{selectedPersonData.jabatan}</span>
               </div>
               <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-white border border-blue-200 text-[#2F5597] w-fit">
-                Peran: {determineTeacherPeran(selectedPersonData, jadwalList, undefined, settings?.attendanceRuleOverrides)}
+                {selectedPersonData.isTempSubstitute
+                  ? 'Guru Pengganti Sementara'
+                  : `Peran: ${determineTeacherPeran(selectedPersonData, jadwalList, undefined, settings?.attendanceRuleOverrides)}`}
               </span>
             </div>
+
+            {selectedPersonData.substitutingFor && selectedPersonData.substitutingFor.length > 0 && (
+              <div className="p-2.5 bg-purple-50 border border-purple-200 rounded-lg text-xs text-purple-950 space-y-1">
+                <span className="font-extrabold text-purple-900 text-[11px] block">
+                  Tugas Pengganti Sementara Aktif:
+                </span>
+                {selectedPersonData.substitutingFor.map((sub, sIdx) => (
+                  <p key={sIdx} className="text-[11px]">
+                    Menggantikan <strong>{sub.guruCutiNama}</strong>
+                    {sub.classNote ? ` (${sub.classNote})` : ''} &bull; {formatLongDateIndonesian(sub.tanggalMulai)} s/d {formatLongDateIndonesian(sub.tanggalSelesai)}
+                  </p>
+                ))}
+              </div>
+            )}
 
             {inputMode !== 'cuti' && (
               <div className="flex items-start gap-2 border-t border-blue-100 pt-2.5">
@@ -963,13 +1083,56 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
           </div>
         )}
 
+        {/* Active Cuti Warning & Quick-Revoke inside Quick/Manual Mode */}
+        {activeCutiForSelected && inputMode !== 'cuti' && (
+          <div className="bg-teal-50 border-2 border-teal-400 rounded-xl p-4 space-y-2.5 text-xs text-teal-950">
+            <div className="flex items-start gap-2.5">
+              <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <p className="font-extrabold text-sm text-teal-950">
+                  Guru Ini Masih Dalam Masa Cuti Resmi ({activeCutiForSelected.jenisCuti})
+                </p>
+                <p className="text-teal-900 leading-relaxed">
+                  Periode cuti tercatat{' '}
+                  <strong>
+                    {formatLongDateIndonesian(activeCutiForSelected.tanggalMulai)} s/d{' '}
+                    {formatLongDateIndonesian(activeCutiForSelected.tanggalSelesai)}
+                  </strong>
+                  {activeCutiForSelected.guruPengganti && activeCutiForSelected.guruPengganti !== '-'
+                    ? ` (Pengganti: ${activeCutiForSelected.guruPengganti})`
+                    : ''}
+                  . Jika guru sudah melapor diri ke TU/Admin untuk aktif kembali mulai tanggal{' '}
+                  <strong>{formatLongDateIndonesian(selectedTanggal)}</strong>, cabut status cutinya terlebih dahulu agar presensi normal dapat dicatat.
+                </p>
+              </div>
+            </div>
+            {onRevokeCuti && (
+              <div className="flex flex-wrap items-center justify-end gap-2 pt-1 border-t border-teal-200">
+                <button
+                  type="button"
+                  disabled={isRevokingCuti}
+                  onClick={() => handleConfirmRevokeCuti(activeCutiForSelected, selectedTanggal)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold shadow-xs transition disabled:opacity-50"
+                >
+                  <RotateCcw className={`w-3.5 h-3.5 ${isRevokingCuti ? 'animate-spin' : ''}`} />
+                  <span>
+                    {isRevokingCuti
+                      ? 'Mencabut Status Cuti...'
+                      : `Cabut Cuti & Aktifkan Kembali Mulai ${formatLongDateIndonesian(selectedTanggal)}`}
+                  </span>
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* MODE 1: QUICK BUTTON */}
         {inputMode === 'quick' && (
           <div className="border-t border-slate-200 pt-5 space-y-3">
             <button
               type="button"
               id="btn-catat-sekarang"
-              disabled={!selectedNama || isSubmitting || isJumat(activeHari)}
+              disabled={!selectedNama || isSubmitting || isJumat(activeHari) || Boolean(activeCutiForSelected)}
               onClick={handleQuickSubmit}
               className="w-full py-4 px-6 bg-[#2F5597] hover:bg-[#244378] text-white font-bold text-base sm:text-lg rounded-2xl shadow-md transition-all flex items-center justify-center gap-3 active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed"
             >
@@ -1123,7 +1286,7 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
             <button
               type="submit"
               id="btn-simpan-manual"
-              disabled={!selectedNama || isSubmitting || isJumat(activeHari)}
+              disabled={!selectedNama || isSubmitting || isJumat(activeHari) || Boolean(activeCutiForSelected)}
               className="w-full py-3 px-4 bg-[#2F5597] hover:bg-[#244378] text-white font-bold rounded-xl shadow-sm transition-all flex items-center justify-center gap-2 text-sm disabled:opacity-50"
             >
               <Send className="w-4 h-4" />
@@ -1346,25 +1509,53 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
                 3. Informasi Pengganti Mengajar &amp; Administrasi Surat (Opsional)
               </label>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label htmlFor="cuti-pengganti" className="block text-[11px] font-bold text-slate-700 mb-1 flex items-center gap-1">
-                    <Users className="w-3.5 h-3.5 text-teal-700" />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-start">
+                <div className="min-w-0">
+                  <label htmlFor="cuti-pengganti" className="text-[11px] font-bold text-slate-700 mb-1 flex items-center gap-1">
+                    <Users className="w-3.5 h-3.5 text-teal-700 shrink-0" />
                     <span>Guru Pengganti / Titip Tugas Kelas</span>
                   </label>
+                  <div className="flex items-center gap-1.5 mb-1.5 min-w-0">
+                    <select
+                      value={cutiPenggantiPicker}
+                      onChange={(e) => setCutiPenggantiPicker(e.target.value)}
+                      className="flex-1 min-w-0 w-full truncate px-2.5 py-2 bg-white border border-teal-200 rounded-xl text-xs text-slate-700 font-medium focus:ring-2 focus:ring-teal-600"
+                    >
+                      <option value="">+ Pilih Guru Internal (opsional)...</option>
+                      {masterList
+                        .filter((m) => m.nama !== selectedNama)
+                        .map((m, idx) => (
+                          <option key={`sub-pick-${idx}-${m.nama}`} value={m.nama}>
+                            {m.nama} ({m.jabatan})
+                          </option>
+                        ))}
+                    </select>
+                    <button
+                      type="button"
+                      disabled={!cutiPenggantiPicker}
+                      onClick={handleAddInternalSubstitute}
+                      className="inline-flex items-center gap-1 px-2.5 py-2 bg-teal-600 hover:bg-teal-700 text-white rounded-xl text-[11px] font-bold disabled:opacity-40 shrink-0 cursor-pointer"
+                    >
+                      <UserPlus className="w-3.5 h-3.5" />
+                      <span>Tambah</span>
+                    </button>
+                  </div>
                   <input
                     type="text"
                     id="cuti-pengganti"
-                    placeholder="Misal: Ust. Ahmad (VII A-D) / Tugas LKS"
+                    placeholder="Ketik nama pengganti eksternal atau pisahkan dengan '; '"
                     value={cutiGuruPengganti}
                     onChange={(e) => setCutiGuruPengganti(e.target.value)}
                     className="w-full px-3 py-2 bg-white border border-slate-300 rounded-xl text-xs sm:text-sm focus:ring-2 focus:ring-teal-600"
                   />
+                  <span className="text-[10px] text-slate-500 mt-1 block">
+                    Nama guru pengganti (internal maupun sementara dari luar) otomatis muncul di daftar presensi selama masa cuti aktif.
+                  </span>
                 </div>
 
-                <div>
-                  <label htmlFor="cuti-nomor-surat" className="block text-[11px] font-bold text-slate-700 mb-1 flex items-center gap-1">
-                    <FileText className="w-3.5 h-3.5 text-teal-700" />
+                <div className="min-w-0">
+                  <label htmlFor="cuti-nomor-surat" className="text-[11px] font-bold text-slate-700 mb-1 flex items-center gap-1">
+                    <FileText className="w-3.5 h-3.5 text-teal-700 shrink-0" />
                     <span>Nomor Surat / Persetujuan Kepala Sekolah</span>
                   </label>
                   <input
@@ -1500,6 +1691,10 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
           {settings?.webAppUrl &&
             hasRemoteCutiSheet &&
             combinedCutiRecords.some((rec) => {
+              const stNorm = String(rec.statusPengajuan || '').trim().toLowerCase();
+              if (stNorm === 'dibatalkan' || (stNorm === 'dicabut' && rec.jumlahHariEfektif === 0)) {
+                return false;
+              }
               const norm = rec.nama.trim().toLowerCase();
               return !existingLogs.some(
                 (l) =>
@@ -1542,6 +1737,10 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
               {combinedCutiRecords.map((rec) => {
                 const isConfirming = confirmDeleteCutiId === rec.id;
                 const isDeleting = deletingCutiId === rec.id;
+                const isRevokingOpen = revokingCutiId === rec.id;
+                const isExtendingOpen = extendingCutiId === rec.id;
+                const statusPengajuan = rec.statusPengajuan || 'Aktif';
+                const isActiveCuti = statusPengajuan === 'Aktif';
                 const normRecName = rec.nama.trim().toLowerCase();
                 const isSyncedToRemoteSheet =
                   Boolean(settings?.webAppUrl) &&
@@ -1563,100 +1762,295 @@ export const InputPresensi: React.FC<InputPresensiProps> = ({
                 return (
                   <div
                     key={rec.id}
-                    className="p-3.5 rounded-xl border border-slate-200 bg-slate-50/70 hover:bg-white transition flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                    className={`p-3.5 rounded-xl border transition space-y-3 ${
+                      statusPengajuan === 'Dicabut'
+                        ? 'border-amber-200 bg-amber-50/40'
+                        : statusPengajuan === 'Dibatalkan'
+                        ? 'border-rose-200 bg-rose-50/30'
+                        : 'border-slate-200 bg-slate-50/70 hover:bg-white'
+                    }`}
                   >
-                    <div className="space-y-1 min-w-0">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-bold text-sm text-slate-900">{rec.nama}</span>
-                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-teal-100 text-teal-800 border border-teal-200">
-                          {rec.jenisCuti}
-                        </span>
-                        <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-slate-200/70 text-slate-700">
-                          {rec.jumlahHariEfektif} hari efektif
-                        </span>
-                        {settings?.webAppUrl ? (
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div className="space-y-1 min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-bold text-sm text-slate-900">{rec.nama}</span>
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-teal-100 text-teal-800 border border-teal-200">
+                            {rec.jenisCuti}
+                          </span>
+                          <span
+                            className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold border ${
+                              statusPengajuan === 'Aktif'
+                                ? 'bg-emerald-100 text-emerald-800 border-emerald-300'
+                                : statusPengajuan === 'Dicabut'
+                                ? 'bg-amber-100 text-amber-900 border-amber-300'
+                                : statusPengajuan === 'Selesai'
+                                ? 'bg-slate-200 text-slate-700 border-slate-300'
+                                : 'bg-rose-100 text-rose-800 border-rose-300'
+                            }`}
+                          >
+                            {statusPengajuan === 'Dicabut' ? 'Dicabut / Aktif Kembali' : statusPengajuan}
+                          </span>
+                          <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-slate-200/70 text-slate-700">
+                            {rec.jumlahHariEfektif} hari efektif
+                          </span>
+                          {settings?.webAppUrl ? (
+                            <>
+                              {isSyncedToRemoteSheet ? (
+                                <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                                  Tersinkron di Data_Cuti
+                                </span>
+                              ) : (
+                                <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200">
+                                  Belum di sheet Data_Cuti
+                                </span>
+                              )}
+                              {syncedLogCount > 0 ? (
+                                <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-sky-50 text-sky-800 border border-sky-200">
+                                  Log_Presensi: {syncedLogCount} hari
+                                </span>
+                              ) : (
+                                <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-rose-50 text-rose-700 border border-rose-200">
+                                  Belum di Log_Presensi
+                                </span>
+                              )}
+                            </>
+                          ) : (
+                            <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-slate-100 text-slate-600 border border-slate-200">
+                              Tersimpan Lokal
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="text-xs text-slate-600 flex flex-wrap items-center gap-x-3 gap-y-1">
+                          <span className="font-semibold text-slate-800">
+                            {rec.tanggalMulai === rec.tanggalSelesai
+                              ? formatLongDateIndonesian(rec.tanggalMulai)
+                              : `${formatLongDateIndonesian(rec.tanggalMulai)} s/d ${formatLongDateIndonesian(rec.tanggalSelesai)}`}
+                          </span>
+                          {rec.guruPengganti && rec.guruPengganti !== '-' && (
+                            <span className="text-teal-800">
+                              Pengganti: <strong>{rec.guruPengganti}</strong>
+                            </span>
+                          )}
+                          {rec.nomorSurat && rec.nomorSurat !== '-' && (
+                            <span className="text-slate-600">
+                              Surat: <strong>{rec.nomorSurat}</strong>
+                            </span>
+                          )}
+                        </div>
+
+                        {rec.catatan && rec.catatan !== '-' && (
+                          <p className="text-[11px] text-slate-500 italic">{rec.catatan}</p>
+                        )}
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                        {onRevokeCuti && isActiveCuti && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setRevokingCutiId(isRevokingOpen ? null : rec.id);
+                              setExtendingCutiId(null);
+                              setConfirmDeleteCutiId(null);
+                              setRevokeReturnDate(formatDateISO());
+                            }}
+                            className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-bold border transition ${
+                              isRevokingOpen
+                                ? 'bg-amber-600 text-white border-amber-700'
+                                : 'bg-amber-50 hover:bg-amber-100 text-amber-900 border-amber-300'
+                            }`}
+                            title="Cabut cuti lebih awal setelah guru lapor diri ke TU/Admin"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            <span>Cabut / Aktifkan</span>
+                          </button>
+                        )}
+
+                        {onExtendCuti && statusPengajuan !== 'Dibatalkan' && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setExtendingCutiId(isExtendingOpen ? null : rec.id);
+                              setRevokingCutiId(null);
+                              setConfirmDeleteCutiId(null);
+                              setExtendEndDate(addCalendarDaysISO(rec.tanggalSelesai || rec.tanggalMulai, 3));
+                              setExtendPengganti(rec.guruPengganti && rec.guruPengganti !== '-' ? rec.guruPengganti : '');
+                              setExtendNomorSurat(rec.nomorSurat && rec.nomorSurat !== '-' ? rec.nomorSurat : '');
+                              setExtendCatatan(rec.catatan && rec.catatan !== '-' ? rec.catatan : '');
+                            }}
+                            className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-bold border transition ${
+                              isExtendingOpen
+                                ? 'bg-teal-700 text-white border-teal-800'
+                                : 'bg-teal-50 hover:bg-teal-100 text-teal-800 border-teal-300'
+                            }`}
+                            title="Perpanjang tanggal selesai cuti"
+                          >
+                            <CalendarPlus className="w-3.5 h-3.5" />
+                            <span>Perpanjang</span>
+                          </button>
+                        )}
+
+                        {onDeleteCuti && (
                           <>
-                            {isSyncedToRemoteSheet ? (
-                              <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
-                                Tersinkron di Data_Cuti
-                              </span>
+                            {isConfirming ? (
+                              <div className="flex items-center gap-1.5 bg-rose-50 border border-rose-200 px-2.5 py-1.5 rounded-lg">
+                                <span className="text-[11px] font-bold text-rose-800">Hapus cuti &amp; log?</span>
+                                <button
+                                  type="button"
+                                  disabled={isDeleting}
+                                  onClick={() => handleConfirmDeleteCuti(rec)}
+                                  className="px-2 py-1 bg-rose-600 hover:bg-rose-700 text-white rounded text-[10px] font-bold disabled:opacity-50"
+                                >
+                                  {isDeleting ? 'Menghapus...' : 'Ya'}
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isDeleting}
+                                  onClick={() => setConfirmDeleteCutiId(null)}
+                                  className="px-2 py-1 bg-white border border-slate-300 text-slate-700 rounded text-[10px] font-bold"
+                                >
+                                  Batal
+                                </button>
+                              </div>
                             ) : (
-                              <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200">
-                                Belum di sheet Data_Cuti
-                              </span>
-                            )}
-                            {syncedLogCount > 0 ? (
-                              <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-sky-50 text-sky-800 border border-sky-200">
-                                Log_Presensi: {syncedLogCount} hari
-                              </span>
-                            ) : (
-                              <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-rose-50 text-rose-700 border border-rose-200">
-                                Belum di Log_Presensi
-                              </span>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setConfirmDeleteCutiId(rec.id);
+                                  setRevokingCutiId(null);
+                                  setExtendingCutiId(null);
+                                }}
+                                className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg border border-transparent hover:border-rose-200 transition"
+                                title="Hapus catatan cuti ini"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
                             )}
                           </>
-                        ) : (
-                          <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-slate-100 text-slate-600 border border-slate-200">
-                            Tersimpan Lokal
-                          </span>
                         )}
                       </div>
-
-                      <div className="text-xs text-slate-600 flex flex-wrap items-center gap-x-3 gap-y-1">
-                        <span className="font-semibold text-slate-800">
-                          {rec.tanggalMulai === rec.tanggalSelesai
-                            ? formatLongDateIndonesian(rec.tanggalMulai)
-                            : `${formatLongDateIndonesian(rec.tanggalMulai)} s/d ${formatLongDateIndonesian(rec.tanggalSelesai)}`}
-                        </span>
-                        {rec.guruPengganti && rec.guruPengganti !== '-' && (
-                          <span className="text-teal-800">
-                            Pengganti: <strong>{rec.guruPengganti}</strong>
-                          </span>
-                        )}
-                        {rec.nomorSurat && rec.nomorSurat !== '-' && (
-                          <span className="text-slate-600">
-                            Surat: <strong>{rec.nomorSurat}</strong>
-                          </span>
-                        )}
-                      </div>
-
-                      {rec.catatan && rec.catatan !== '-' && (
-                        <p className="text-[11px] text-slate-500 italic">{rec.catatan}</p>
-                      )}
                     </div>
 
-                    {onDeleteCuti && (
-                      <div className="flex items-center gap-2 shrink-0">
-                        {isConfirming ? (
-                          <div className="flex items-center gap-1.5 bg-rose-50 border border-rose-200 px-2.5 py-1.5 rounded-lg">
-                            <span className="text-[11px] font-bold text-rose-800">Hapus cuti &amp; log hariannya?</span>
+                    {/* Inline Panel: Cabut / Selesai Lebih Awal */}
+                    {isRevokingOpen && onRevokeCuti && (
+                      <div className="p-3 bg-amber-50 border border-amber-300 rounded-xl space-y-2.5 text-xs">
+                        <div className="font-bold text-amber-950 flex items-center gap-1.5">
+                          <RotateCcw className="w-4 h-4 text-amber-700" />
+                          <span>Cabut Cuti &amp; Aktifkan Kembali ({rec.nama})</span>
+                        </div>
+                        <p className="text-[11px] text-amber-900 leading-relaxed">
+                          Catatan cuti sebelum tanggal masuk kembali tetap tersimpan sebagai riwayat sah, sedangkan status <strong>Cuti</strong> mulai tanggal masuk kembali ke atas akan dihapus dari <code className="font-mono font-bold">Log_Presensi</code> dan nama guru pengganti sementara otomatis dinonaktifkan.
+                        </p>
+                        <div className="flex flex-col sm:flex-row sm:items-end gap-2">
+                          <div className="flex-1">
+                            <label className="block text-[11px] font-bold text-amber-900 mb-1">
+                              Tanggal Mulai Aktif / Masuk Sekolah Kembali:
+                            </label>
+                            <input
+                              type="date"
+                              value={revokeReturnDate}
+                              min={rec.tanggalMulai}
+                              onChange={(e) => setRevokeReturnDate(e.target.value)}
+                              className="w-full px-3 py-1.5 bg-white border border-amber-300 rounded-lg text-xs font-semibold text-slate-800"
+                            />
+                          </div>
+                          <div className="flex items-center gap-2">
                             <button
                               type="button"
-                              disabled={isDeleting}
-                              onClick={() => handleConfirmDeleteCuti(rec)}
-                              className="px-2 py-1 bg-rose-600 hover:bg-rose-700 text-white rounded text-[10px] font-bold disabled:opacity-50"
+                              disabled={isRevokingCuti || !revokeReturnDate}
+                              onClick={() => handleConfirmRevokeCuti(rec, revokeReturnDate)}
+                              className="px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-bold disabled:opacity-50"
                             >
-                              {isDeleting ? 'Menghapus...' : 'Ya, Hapus'}
+                              {isRevokingCuti ? 'Memproses...' : 'Konfirmasi Cabut Cuti'}
                             </button>
                             <button
                               type="button"
-                              disabled={isDeleting}
-                              onClick={() => setConfirmDeleteCutiId(null)}
-                              className="px-2 py-1 bg-white border border-slate-300 text-slate-700 rounded text-[10px] font-bold"
+                              disabled={isRevokingCuti}
+                              onClick={() => setRevokingCutiId(null)}
+                              className="px-3 py-2 bg-white border border-slate-300 text-slate-700 rounded-lg text-xs font-bold"
                             >
                               Batal
                             </button>
                           </div>
-                        ) : (
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Inline Panel: Perpanjang Cuti */}
+                    {isExtendingOpen && onExtendCuti && (
+                      <div className="p-3 bg-teal-50 border border-teal-300 rounded-xl space-y-2.5 text-xs">
+                        <div className="font-bold text-teal-950 flex items-center gap-1.5">
+                          <CalendarPlus className="w-4 h-4 text-teal-700" />
+                          <span>Perpanjang Masa Cuti ({rec.nama})</span>
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                          <div>
+                            <label className="block text-[11px] font-bold text-teal-900 mb-1">
+                              Tanggal Selesai Baru:
+                            </label>
+                            <input
+                              type="date"
+                              value={extendEndDate}
+                              min={rec.tanggalMulai}
+                              onChange={(e) => setExtendEndDate(e.target.value)}
+                              className="w-full px-3 py-1.5 bg-white border border-teal-300 rounded-lg text-xs font-semibold text-slate-800"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[11px] font-bold text-teal-900 mb-1">
+                              Guru Pengganti (Opsional):
+                            </label>
+                            <input
+                              type="text"
+                              value={extendPengganti}
+                              onChange={(e) => setExtendPengganti(e.target.value)}
+                              placeholder="Nama guru pengganti..."
+                              className="w-full px-3 py-1.5 bg-white border border-teal-300 rounded-lg text-xs text-slate-800"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[11px] font-bold text-teal-900 mb-1">
+                              Nomor Surat Perpanjangan:
+                            </label>
+                            <input
+                              type="text"
+                              value={extendNomorSurat}
+                              onChange={(e) => setExtendNomorSurat(e.target.value)}
+                              placeholder="Nomor surat izin..."
+                              className="w-full px-3 py-1.5 bg-white border border-teal-300 rounded-lg text-xs text-slate-800"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[11px] font-bold text-teal-900 mb-1">
+                              Catatan Tambahan:
+                            </label>
+                            <input
+                              type="text"
+                              value={extendCatatan}
+                              onChange={(e) => setExtendCatatan(e.target.value)}
+                              placeholder="Alasan perpanjangan..."
+                              className="w-full px-3 py-1.5 bg-white border border-teal-300 rounded-lg text-xs text-slate-800"
+                            />
+                          </div>
+                        </div>
+                        <div className="flex items-center justify-end gap-2 pt-1">
                           <button
                             type="button"
-                            onClick={() => setConfirmDeleteCutiId(rec.id)}
-                            className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg border border-transparent hover:border-rose-200 transition"
-                            title="Hapus catatan cuti ini"
+                            disabled={isExtendingCuti}
+                            onClick={() => setExtendingCutiId(null)}
+                            className="px-3 py-1.5 bg-white border border-slate-300 text-slate-700 rounded-lg text-xs font-bold"
                           >
-                            <Trash2 className="w-4 h-4" />
+                            Batal
                           </button>
-                        )}
+                          <button
+                            type="button"
+                            disabled={isExtendingCuti || !extendEndDate}
+                            onClick={() => handleConfirmExtendCuti(rec)}
+                            className="px-3.5 py-1.5 bg-teal-600 hover:bg-teal-700 text-white rounded-lg text-xs font-bold disabled:opacity-50"
+                          >
+                            {isExtendingCuti ? 'Menyimpan...' : 'Simpan Perpanjangan'}
+                          </button>
+                        </div>
                       </div>
                     )}
                   </div>

@@ -5,7 +5,8 @@ import {
   AppSettings,
   StatusPresensi,
   HariSekolah,
-  JadwalSlot
+  JadwalSlot,
+  DataCutiRecord
 } from '../types';
 import {
   calculateDistanceMeters,
@@ -20,10 +21,12 @@ import {
   DEFAULT_SCHOOL_COORDS,
   normalizeCoordinate
 } from '../utils/qrAndGeoUtils';
-import { getHariFromDate, formatDateISO, formatTimeHHMM } from '../utils/dateUtils';
+import { getHariFromDate, formatDateISO, formatTimeHHMM, formatLongDateIndonesian } from '../utils/dateUtils';
 import { evaluateStatus24h, parseAndFormat24hTime, timeToMinutes, minutesToTime } from '../utils/timeUtils';
-import { evaluateTeacherAttendanceStatus, evaluateTeacherScheduleForDay, determineTeacherPeran, isTeacherWajibHadir, resolveTeacherAttendanceRule } from '../utils/scheduleTimeEvaluator';
-import { getMasterDataSourceLabel, getRawMapelByDay, verifyPinRemote } from '../utils/googleAppsScript';
+import { evaluateTeacherAttendanceStatus, evaluateTeacherScheduleForDay, determineTeacherPeran, isTeacherWajibHadir, resolveTeacherAttendanceRule, isGuruBkJabatan } from '../utils/scheduleTimeEvaluator';
+import { computeTeacherAutoAlpaDeadline } from '../utils/autoAlpaUtils';
+import { findActiveCutiForTeacher, formatSubstituteAttendanceNote, getSubstitutedSchedulesForDay } from '../utils/cutiUtils';
+import { getMasterDataSourceLabel, getRawMapelByDay, verifyPinRemote, DEFAULT_WHATSAPP_GROUP_URL } from '../utils/googleAppsScript';
 import { buildMapelString, isJadwalTidakDitemukan } from '../utils/jadwalEngine';
 import { QrCameraScanner } from './QrCameraScanner';
 import { TeacherIdCard } from './TeacherIdCard';
@@ -51,12 +54,17 @@ import {
   ExternalLink,
   BookOpen,
   CalendarDays,
-  ChevronUp
+  ChevronUp,
+  Send,
+  Copy,
+  MessageSquare,
+  FileText
 } from 'lucide-react';
 
 interface MobileSelfPresensiProps {
   masterList: MasterGuruStaf[];
   existingLogs: LogPresensi[];
+  cutiList?: DataCutiRecord[];
   settings: AppSettings;
   isAdmin?: boolean;
   selectedTeacherName: string;
@@ -70,6 +78,7 @@ interface MobileSelfPresensiProps {
 export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
   masterList,
   existingLogs,
+  cutiList = [],
   settings,
   isAdmin = false,
   selectedTeacherName,
@@ -106,6 +115,16 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
   const hariIni = getHariFromDate(todayISO) as HariSekolah;
   const [viewingHari, setViewingHari] = useState<HariSekolah>(hariIni);
   const [showWeeklySchedule, setShowWeeklySchedule] = useState<boolean>(false);
+
+  // Remote Izin / Sakit / Dinas Luar (tanpa GPS) state
+  const [showAbsenceModal, setShowAbsenceModal] = useState<boolean>(false);
+  const [absenceType, setAbsenceType] = useState<'Izin' | 'Sakit' | 'Dinas Luar'>('Izin');
+  const [absenceReason, setAbsenceReason] = useState<string>('');
+  const [absenceTask, setAbsenceTask] = useState<string>('');
+  const [absenceError, setAbsenceError] = useState<string>('');
+  const [isSubmittingAbsence, setIsSubmittingAbsence] = useState<boolean>(false);
+  const [absenceSavedLog, setAbsenceSavedLog] = useState<LogPresensi | null>(null);
+  const [waCopied, setWaCopied] = useState<boolean>(false);
 
   // Sync viewingHari if hariIni changes
   useEffect(() => {
@@ -165,6 +184,9 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
   const scheduleEval = teacher
     ? evaluateTeacherScheduleForDay(teacher, hariIni, settings.jamMasukThreshold || '07:25', jadwalList, settings.attendanceRuleOverrides)
     : null;
+  const autoAlpaInfo = teacher
+    ? computeTeacherAutoAlpaDeadline(teacher, hariIni, settings, jadwalList)
+    : null;
 
   const schoolThresholdDefault = settings.jamMasukThreshold || '07:25';
   const hasTeachingTodayMain = Boolean(scheduleEval?.hasTeachingSchedule && scheduleEval.sesiList.length > 0);
@@ -186,10 +208,25 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
     ? evaluateTeacherScheduleForDay(teacher, viewingHari, schoolThresholdDefault, jadwalList, settings.attendanceRuleOverrides)
     : null;
 
-  // Today's attendance log for this teacher if any
+  // Substituted teacher schedules for the day being viewed (for both internal & external substitutes)
+  const substitutedSchedulesForViewingDay = teacher
+    ? getSubstitutedSchedulesForDay({
+        teacher,
+        masterList,
+        hari: viewingHari,
+        threshold: schoolThresholdDefault,
+        jadwalList,
+        attendanceRuleOverrides: settings.attendanceRuleOverrides
+      })
+    : [];
+
+  // Today's attendance log & active Cuti check for this teacher
   const todayLog = existingLogs.find(
     l => l.nama.trim().toLowerCase() === selectedTeacherName.trim().toLowerCase() && l.tanggal === todayISO
   );
+  const activeCutiToday = teacher
+    ? findActiveCutiForTeacher(teacher.nama, todayISO, cutiList, existingLogs)
+    : null;
 
   const expectedEval = todayLog && teacher
     ? evaluateTeacherAttendanceStatus(
@@ -212,6 +249,219 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
     todayLog.status === 'Terlambat' &&
     expectedStatusForTodayLog === 'Tepat Waktu'
   );
+
+  // Teacher's live quota usage for current period (Bulanan / Semester)
+  const teacherQuotaSummary = (() => {
+    const maxIzin = settings.quotaIzin ?? 3;
+    const maxSakit = settings.quotaSakit ?? 5;
+    const maxDinas = settings.quotaDinasLuar ?? 5;
+    const maxAlpa = settings.quotaAlpa ?? 1;
+    const periodeMode = settings.quotaPeriode || 'Bulanan';
+    const currentMonth = todayISO.slice(0, 7);
+    const periodStart = periodeMode === 'Bulanan'
+      ? `${currentMonth}-01`
+      : (settings.quotaTanggalMulai || `${todayISO.slice(0, 4)}-07-01`);
+    const periodEnd = periodeMode === 'Bulanan' ? `${currentMonth}-31` : todayISO;
+    const periodLabel = periodeMode === 'Bulanan'
+      ? new Date(`${currentMonth}-01T00:00:00`).toLocaleDateString('id-ID', { month: 'long', year: 'numeric' })
+      : 'Semester Berjalan';
+
+    let izin = 0;
+    let sakit = 0;
+    let dinas = 0;
+    let alpa = 0;
+
+    if (teacher) {
+      const targetClean = cleanTeacherName(teacher.nama);
+      for (const l of existingLogs) {
+        if (!l.tanggal || l.tanggal < periodStart || l.tanggal > periodEnd) continue;
+        const lClean = cleanTeacherName(l.nama);
+        if (lClean !== targetClean && l.nama.trim().toLowerCase() !== teacher.nama.trim().toLowerCase()) continue;
+        if (l.status === 'Izin') izin++;
+        else if (l.status === 'Sakit') sakit++;
+        else if (l.status === 'Dinas Luar') dinas++;
+        else if ((l.status || '').includes('Alpa')) alpa++;
+      }
+    }
+
+    return {
+      periodeMode,
+      periodLabel,
+      izin,
+      sakit,
+      dinas,
+      alpa,
+      maxIzin,
+      maxSakit,
+      maxDinas,
+      maxAlpa
+    };
+  })();
+
+  // Today's teaching sessions (own + substituted classes) for absence task box
+  const todaySubstitutedGroups = teacher
+    ? getSubstitutedSchedulesForDay({
+        teacher,
+        masterList,
+        hari: hariIni,
+        threshold: schoolThresholdDefault,
+        jadwalList,
+        attendanceRuleOverrides: settings.attendanceRuleOverrides
+      })
+    : [];
+
+  const todayTeachingSessions = (() => {
+    if (!teacher) return [] as Array<{ labelJam: string; namaMapel: string; kelas: string; jamMulai: string; jamSelesai: string; guruCutiNama?: string }>;
+    const own = !teacher.isTempSubstitute && scheduleEval?.sesiList ? scheduleEval.sesiList : [];
+    const sub = todaySubstitutedGroups.flatMap((g) =>
+      g.matchedSesiList.map((s) => ({ ...s, guruCutiNama: g.assignment.guruCutiNama }))
+    );
+    return [...own, ...sub];
+  })();
+
+  const hasAnyTeachingToday = todayTeachingSessions.length > 0;
+  const todayScheduleSummaryText = hasAnyTeachingToday
+    ? todayTeachingSessions
+        .map((s) => `${s.labelJam} ${s.namaMapel} (${s.kelas})${s.guruCutiNama ? ` [Pengganti ${s.guruCutiNama}]` : ''}`)
+        .join(', ')
+    : 'Tidak ada jam mengajar tatap muka';
+
+  const waGroupUrl = settings.whatsappGroupUrl || DEFAULT_WHATSAPP_GROUP_URL;
+
+  const parseAbsenceKeterangan = (rawKet?: string): { reason: string; task: string } => {
+    const cleaned = (rawKet || '').replace(/\[Pengajuan Mandiri Dari Rumah\]/gi, '').trim();
+    const parts = cleaned.split(/\s*\|\s*Tugas Siswa:\s*/i);
+    return {
+      reason: (parts[0] || '').trim(),
+      task: (parts[1] || '').trim()
+    };
+  };
+
+  const buildAbsenceWaMessage = (params: {
+    status: string;
+    reason: string;
+    task?: string;
+    jadwalText?: string;
+  }) => {
+    if (!teacher) return '';
+    const tglLabel = formatLongDateIndonesian(todayISO);
+    const lines = [
+      `Assalamu'alaikum Wr. Wb.`,
+      `*LAPORAN KETIDAKHADIRAN GURU / STAF*`,
+      `SMP Nurul Abror Al-Robbaniyin`,
+      ``,
+      `• Nama: *${teacher.nama}*`,
+      `• Jabatan: ${teacher.jabatan}`,
+      `• Hari/Tanggal: ${hariIni}, ${tglLabel}`,
+      `• Status: *${params.status}*`,
+      `• Keterangan/Alasan: ${params.reason || '-'}`,
+      `• Jadwal Mengajar: ${params.jadwalText || todayScheduleSummaryText}`,
+      `• Tugas untuk Siswa: ${params.task && params.task.trim() ? params.task.trim() : '-'}`,
+      `• Info Kuota (${teacherQuotaSummary.periodLabel}): Izin ${teacherQuotaSummary.izin}/${teacherQuotaSummary.maxIzin} | Sakit ${teacherQuotaSummary.sakit}/${teacherQuotaSummary.maxSakit} | Dinas ${teacherQuotaSummary.dinas}/${teacherQuotaSummary.maxDinas} | Alpa ${teacherQuotaSummary.alpa}/${teacherQuotaSummary.maxAlpa}`,
+      ``,
+      `Data telah tercatat otomatis di Aplikasi Presensi Sekolah. Mohon izin/maklum.`,
+      `Terima kasih. Wassalamu'alaikum Wr. Wb.`
+    ];
+    return lines.join('\n');
+  };
+
+  const handleCopyWaMessage = async (msg: string) => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(msg);
+      }
+      setWaCopied(true);
+      setTimeout(() => setWaCopied(false), 3000);
+    } catch (e) {
+      // Ignore clipboard failure silently
+    }
+  };
+
+  const handleOpenAbsenceModal = (defaultType: 'Izin' | 'Sakit' | 'Dinas Luar' = 'Izin') => {
+    setAbsenceType(defaultType);
+    setAbsenceReason('');
+    setAbsenceTask('');
+    setAbsenceError('');
+    setAbsenceSavedLog(null);
+    setWaCopied(false);
+    setShowAbsenceModal(true);
+  };
+
+  const handleSubmitRemoteAbsence = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAbsenceError('');
+
+    if (!teacher) {
+      setAbsenceError('Silakan pilih nama Anda terlebih dahulu.');
+      return;
+    }
+
+    if (activeCutiToday || todayLog?.status === 'Cuti') {
+      setAbsenceError('Anda masih tercatat dalam masa Cuti resmi. Tidak perlu mengajukan izin harian.');
+      return;
+    }
+
+    if (settings.requireDeviceLock) {
+      const lockCheck = checkDeviceLock(todayISO, teacher.nama);
+      if (!lockCheck.allowed) {
+        setAbsenceError(
+          `HP ini sudah digunakan untuk presensi atas nama "${lockCheck.lockedToName}" hari ini (aturan anti-titip absen).`
+        );
+        playErrorBeep();
+        return;
+      }
+    }
+
+    const cleanReason = absenceReason.trim();
+    const cleanTask = absenceTask.trim();
+
+    if (!cleanReason) {
+      setAbsenceError(`Mohon isi alasan / keterangan ${absenceType} terlebih dahulu.`);
+      return;
+    }
+
+    if (hasAnyTeachingToday && !cleanTask) {
+      setAbsenceError(
+        'Anda memiliki jadwal mengajar hari ini. Mohon isi kolom Tugas untuk Siswa (atau tuliskan titipan tugas ke guru piket).'
+      );
+      return;
+    }
+
+    setIsSubmittingAbsence(true);
+    const now = new Date();
+    const subNote = formatSubstituteAttendanceNote(teacher);
+    const ketParts = [cleanReason];
+    if (cleanTask) ketParts.push(`Tugas Siswa: ${cleanTask}`);
+    const fullKet = `${ketParts.join(' | ')}${subNote ? ` ${subNote}` : ''} [Pengajuan Mandiri Dari Rumah]`;
+
+    const newLog: LogPresensi = {
+      id: todayLog?.id || `LOG-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      timestamp: now.toISOString(),
+      tanggal: todayISO,
+      hari: hariIni,
+      nama: teacher.nama,
+      jabatan: teacher.jabatan,
+      mapelHariIni: hasAnyTeachingToday ? todayScheduleSummaryText : (scheduleEval?.mapelHariIni || mapelHariIni),
+      jamDatang: '-',
+      status: absenceType,
+      keterangan: fullKet,
+      metodePresensi: 'QR HP Guru',
+      peran: ruleInfo?.peran || determineTeacherPeran(teacher, jadwalList, undefined, settings.attendanceRuleOverrides)
+    };
+
+    const res = await onSaveLog(newLog);
+    setIsSubmittingAbsence(false);
+
+    if (res.success) {
+      recordDeviceLock(todayISO, teacher.nama);
+      playSuccessChime();
+      setAbsenceSavedLog(newLog);
+    } else {
+      playErrorBeep();
+      // Even if offline fallback stored locally, show WA share options
+      setAbsenceSavedLog(newLog);
+    }
+  };
 
   const handleCorrectStatus = async () => {
     if (!todayLog || !teacher) return;
@@ -384,6 +634,20 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
       return;
     }
 
+    if (activeCutiToday || todayLog?.status === 'Cuti') {
+      const endLabel = activeCutiToday?.tanggalSelesai
+        ? formatLongDateIndonesian(activeCutiToday.tanggalSelesai)
+        : todayISO;
+      setResultModal({
+        status: 'warning',
+        title: 'Masih Dalam Masa Cuti Resmi',
+        message: `${teacher.nama} masih berstatus ${activeCutiToday?.jenisCuti || 'Cuti'} s/d ${endLabel}. Jika sudah aktif kembali bekerja, silakan lapor diri ke TU / Admin untuk mencabut status cuti terlebih dahulu sebelum mengisi presensi.`
+      });
+      setIsScannerOpen(false);
+      playErrorBeep();
+      return;
+    }
+
     // 1. Verify QR if provided (Gate poster scan)
     if (scannedCode) {
       const isValid = validateSchoolQr(scannedCode, settings.schoolQrSecret);
@@ -456,7 +720,8 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
     );
     const status: StatusPresensi = evalResult.status;
 
-    let ketDetail = `${evalResult.keterangan} [${scannedViaGoogleLens ? 'Google Lens' : (scannedCode ? 'Scan Poster Gerbang' : 'Presensi Mandiri')}${distanceMeters !== null ? ' • ' + distanceMeters.toLocaleString('id-ID') + 'm' : ''}]`;
+    const subNote = formatSubstituteAttendanceNote(teacher);
+    let ketDetail = `${evalResult.keterangan}${subNote ? ' ' + subNote : ''} [${scannedViaGoogleLens ? 'Google Lens' : (scannedCode ? 'Scan Poster Gerbang' : 'Presensi Mandiri')}${distanceMeters !== null ? ' • ' + distanceMeters.toLocaleString('id-ID') + 'm' : ''}]`;
 
     const newLog: LogPresensi = {
       id: todayLog?.id || `LOG-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -601,11 +866,18 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
             className="w-full appearance-none bg-slate-50 border-2 border-slate-200 hover:border-blue-400 focus:border-[#2F5597] rounded-2xl px-4 py-3.5 text-sm sm:text-base font-extrabold text-slate-900 focus:outline-none transition shadow-sm pr-10 cursor-pointer"
           >
             <option value="">-- Sentuh untuk Memilih Nama Anda --</option>
-            {masterList.map((t, idx) => (
-              <option key={`self-opt-${t.no || idx}-${t.nama}-${idx}`} value={t.nama}>
-                {t.nama} &mdash; {t.jabatan}
-              </option>
-            ))}
+            {masterList.map((t, idx) => {
+              const subSuffix = t.isTempSubstitute
+                ? ` — [Pengganti Sementara]`
+                : t.substitutingFor && t.substitutingFor.length > 0
+                ? ` — ${t.jabatan} (+Pengganti ${t.substitutingFor.map((s) => s.guruCutiNama).join(', ')})`
+                : ` — ${t.jabatan}`;
+              return (
+                <option key={`self-opt-${t.no || idx}-${t.nama}-${idx}`} value={t.nama}>
+                  {t.nama}{subSuffix}
+                </option>
+              );
+            })}
           </select>
           <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-slate-500">
             <ChevronDown className="w-5 h-5" />
@@ -624,12 +896,36 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
 
             return (
               <div className="p-3.5 bg-slate-50 rounded-2xl border border-slate-200/80 flex flex-col gap-2.5 text-xs">
+                {teacher.substitutingFor && teacher.substitutingFor.length > 0 && (
+                  <div className="p-2.5 bg-purple-50 border border-purple-200 rounded-xl text-[11px] text-purple-950 space-y-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-extrabold text-purple-900 uppercase tracking-wider text-[10px]">
+                        {teacher.isTempSubstitute ? 'Guru Pengganti Sementara (Aktif)' : 'Tugas Pengganti Sementara'}
+                      </span>
+                      <span className="px-2 py-0.5 bg-purple-200 text-purple-900 rounded-full text-[9.5px] font-black">
+                        Sementara
+                      </span>
+                    </div>
+                    {teacher.substitutingFor.map((sub, sIdx) => (
+                      <p key={sIdx} className="leading-snug">
+                        Menggantikan: <strong>{sub.guruCutiNama}</strong>
+                        {sub.classNote ? ` (${sub.classNote})` : ''} &bull;{' '}
+                        <span className="text-purple-800">
+                          {formatLongDateIndonesian(sub.tanggalMulai)} s/d {formatLongDateIndonesian(sub.tanggalSelesai)}
+                        </span>
+                      </p>
+                    ))}
+                  </div>
+                )}
+
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
                     <div className="flex items-center gap-1.5 flex-wrap">
                       <p className="font-extrabold text-slate-900">{teacher.jabatan}</p>
                       <span className={`px-2 py-0.5 rounded-md text-[10px] font-black border ${
-                        teacherPeran === 'Guru'
+                        teacher.isTempSubstitute
+                          ? 'bg-purple-100 text-purple-900 border-purple-300'
+                          : teacherPeran === 'Guru'
                           ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
                           : teacherPeran === 'Guru BK'
                           ? 'bg-teal-50 text-teal-800 border-teal-200'
@@ -639,7 +935,7 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
                           ? 'bg-amber-50 text-amber-800 border-amber-200'
                           : 'bg-slate-100 text-slate-700 border-slate-300'
                       }`}>
-                        Peran: {teacherPeran}
+                        {teacher.isTempSubstitute ? 'Pengganti Sementara' : `Peran: ${teacherPeran}`}
                       </span>
                     </div>
 
@@ -691,6 +987,13 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
                           )}
                         </>
                       )}
+
+                      {settings.autoAlpaEnabled !== false && autoAlpaInfo?.wajibHadir && autoAlpaInfo.deadlineTime && !todayLog && (
+                        <span className="px-2 py-0.5 bg-rose-50 text-rose-800 border border-rose-200 font-bold rounded-md text-[10.5px]">
+                          Batas Tutup Otomatis (Alpa): <strong className="text-rose-900">{autoAlpaInfo.deadlineTime} WIB</strong>
+                          {settings.autoAlpaCutoffMode !== 'batas_akhir_tetap' ? ` (+${autoAlpaInfo.graceMenit} mnt)` : ''}
+                        </span>
+                      )}
                     </div>
                   </div>
 
@@ -714,9 +1017,11 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
                           : todayLog.status}
                         {todayLog.jamDatang && todayLog.jamDatang !== '-' ? ` (${todayLog.jamDatang})` : ''}
                       </span>
-                      {todayLog.statusStaf && todayLog.statusMengajar && (
+                      {todayLog.statusStaf && todayLog.statusStaf !== '-' && todayLog.statusMengajar && todayLog.statusMengajar !== '-' && (
                         <span className="block text-[9.5px] text-slate-500 font-mono mt-0.5">
-                          Staf: {todayLog.statusStaf} | Ajar: {todayLog.statusMengajar}
+                          {resolvedRule.isGuruBk || (todayLog.peran || '').toLowerCase().includes('bk') || isGuruBkJabatan(teacher.jabatan)
+                            ? 'Guru BK'
+                            : 'Staf'}: {todayLog.statusStaf} | Ajar: {todayLog.statusMengajar}
                         </span>
                       )}
                     </div>
@@ -727,13 +1032,65 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
                   )}
                 </div>
 
+                {/* Aturan & Sisa Kuota Ketidakhadiran Sekolah */}
+                <div className="p-2.5 bg-white rounded-xl border border-slate-200/90 space-y-1.5">
+                  <div className="flex items-center justify-between gap-2 text-[10.5px]">
+                    <span className="font-extrabold text-slate-700">
+                      Kuota Ketidakhadiran ({teacherQuotaSummary.periodLabel}):
+                    </span>
+                    <span className="text-[9.5px] font-semibold text-slate-400">
+                      Aturan Sekolah
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-4 gap-1.5 text-center text-[10px]">
+                    <div className={`px-1.5 py-1 rounded-lg border font-bold ${
+                      teacherQuotaSummary.maxIzin > 0 && teacherQuotaSummary.izin >= teacherQuotaSummary.maxIzin
+                        ? 'bg-rose-50 border-rose-200 text-rose-800'
+                        : teacherQuotaSummary.maxIzin > 1 && teacherQuotaSummary.izin === teacherQuotaSummary.maxIzin - 1
+                        ? 'bg-amber-50 border-amber-200 text-amber-800'
+                        : 'bg-sky-50/70 border-sky-200 text-sky-900'
+                    }`}>
+                      <span className="block text-[9px] font-semibold opacity-80">Izin</span>
+                      <span>{teacherQuotaSummary.izin}/{teacherQuotaSummary.maxIzin}</span>
+                    </div>
+                    <div className={`px-1.5 py-1 rounded-lg border font-bold ${
+                      teacherQuotaSummary.maxSakit > 0 && teacherQuotaSummary.sakit >= teacherQuotaSummary.maxSakit
+                        ? 'bg-rose-50 border-rose-200 text-rose-800'
+                        : teacherQuotaSummary.maxSakit > 1 && teacherQuotaSummary.sakit === teacherQuotaSummary.maxSakit - 1
+                        ? 'bg-amber-50 border-amber-200 text-amber-800'
+                        : 'bg-indigo-50/70 border-indigo-200 text-indigo-900'
+                    }`}>
+                      <span className="block text-[9px] font-semibold opacity-80">Sakit</span>
+                      <span>{teacherQuotaSummary.sakit}/{teacherQuotaSummary.maxSakit}</span>
+                    </div>
+                    <div className={`px-1.5 py-1 rounded-lg border font-bold ${
+                      teacherQuotaSummary.maxDinas > 0 && teacherQuotaSummary.dinas >= teacherQuotaSummary.maxDinas
+                        ? 'bg-rose-50 border-rose-200 text-rose-800'
+                        : 'bg-purple-50/70 border-purple-200 text-purple-900'
+                    }`}>
+                      <span className="block text-[9px] font-semibold opacity-80">Dinas</span>
+                      <span>{teacherQuotaSummary.dinas}/{teacherQuotaSummary.maxDinas}</span>
+                    </div>
+                    <div className={`px-1.5 py-1 rounded-lg border font-bold ${
+                      teacherQuotaSummary.maxAlpa > 0 && teacherQuotaSummary.alpa >= teacherQuotaSummary.maxAlpa
+                        ? 'bg-rose-100 border-rose-300 text-rose-900'
+                        : 'bg-slate-100 border-slate-200 text-slate-700'
+                    }`}>
+                      <span className="block text-[9px] font-semibold opacity-80">Alpa</span>
+                      <span>{teacherQuotaSummary.alpa}/{teacherQuotaSummary.maxAlpa}</span>
+                    </div>
+                  </div>
+                </div>
+
             {/* Detail Pelajaran Hari Ini / Pilihan Hari (Format Ringkas 3 Sesi Sehari) */}
             <div className="p-3.5 bg-white rounded-2xl border border-slate-200/90 text-[11px] space-y-2.5 shadow-xs">
               <div className="flex flex-wrap items-center justify-between gap-1.5 border-b border-slate-100 pb-2">
                 <div className="flex items-center gap-1.5">
                   <BookOpen className="w-4 h-4 text-[#2F5597]" />
                   <span className="text-slate-700 font-extrabold uppercase tracking-wider text-[10.5px]">
-                    Jadwal Mengajar ({viewingHari}):
+                    {teacher.isTempSubstitute
+                      ? `Jadwal Pengganti (${viewingHari}):`
+                      : `Jadwal Mengajar (${viewingHari}):`}
                   </span>
                   {viewingHari === hariIni && (
                     <span className="text-[9.5px] font-black px-1.5 py-0.5 bg-emerald-100 text-emerald-800 rounded border border-emerald-300">
@@ -793,82 +1150,148 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
                 </div>
               )}
 
-              {viewingScheduleEval?.hasTeachingSchedule && viewingScheduleEval.sesiList.length > 0 ? (
-                <div className="space-y-2">
-                  <div className="grid grid-cols-1 gap-1.5">
-                    {viewingScheduleEval.sesiList.map((sesi, idx) => (
-                      <div key={idx} className="flex items-center justify-between p-2.5 bg-slate-50/90 rounded-xl border border-slate-200/90 hover:bg-white transition shadow-2xs">
-                        <div className="flex items-center gap-2 min-w-0">
-                          <span className={`px-2 py-0.5 rounded-md text-[10.5px] font-black shrink-0 ${
-                            sesi.labelJam.includes('I-II')
-                              ? 'bg-amber-100 text-amber-900 border border-amber-300'
-                              : sesi.labelJam.includes('III-IV')
-                              ? 'bg-emerald-100 text-emerald-900 border border-emerald-300'
-                              : 'bg-indigo-100 text-indigo-900 border border-indigo-300'
-                          }`}>
-                            {sesi.labelJam}
-                          </span>
-                          <span className="font-extrabold text-slate-800 text-xs truncate">
-                            {sesi.namaMapel}
-                          </span>
-                        </div>
-                        <div className="flex items-center gap-1.5 shrink-0">
-                          {sesi.kelas && sesi.kelas !== '-' && (
-                            <span className="font-black text-blue-900 bg-blue-100/90 border border-blue-200 px-2 py-0.5 rounded-md text-[11px]">
-                              {sesi.kelas}
+              {(!teacher.isTempSubstitute || substitutedSchedulesForViewingDay.length === 0) && (
+                viewingScheduleEval?.hasTeachingSchedule && viewingScheduleEval.sesiList.length > 0 ? (
+                  <div className="space-y-2">
+                    <div className="grid grid-cols-1 gap-1.5">
+                      {viewingScheduleEval.sesiList.map((sesi, idx) => (
+                        <div key={idx} className="flex items-center justify-between p-2.5 bg-slate-50/90 rounded-xl border border-slate-200/90 hover:bg-white transition shadow-2xs">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className={`px-2 py-0.5 rounded-md text-[10.5px] font-black shrink-0 ${
+                              sesi.labelJam.includes('I-II')
+                                ? 'bg-amber-100 text-amber-900 border border-amber-300'
+                                : sesi.labelJam.includes('III-IV')
+                                ? 'bg-emerald-100 text-emerald-900 border border-emerald-300'
+                                : 'bg-indigo-100 text-indigo-900 border border-indigo-300'
+                            }`}>
+                              {sesi.labelJam}
                             </span>
-                          )}
-                          <span className="text-[10px] text-slate-600 font-mono font-bold bg-white px-1.5 py-0.5 rounded border border-slate-200">
-                            {sesi.jamMulai} - {sesi.jamSelesai} WIB
-                          </span>
+                            <span className="font-extrabold text-slate-800 text-xs truncate">
+                              {sesi.namaMapel}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            {sesi.kelas && sesi.kelas !== '-' && (
+                              <span className="font-black text-blue-900 bg-blue-100/90 border border-blue-200 px-2 py-0.5 rounded-md text-[11px]">
+                                {sesi.kelas}
+                              </span>
+                            )}
+                            <span className="text-[10px] text-slate-600 font-mono font-bold bg-white px-1.5 py-0.5 rounded border border-slate-200">
+                              {sesi.jamMulai} - {sesi.jamSelesai} WIB
+                            </span>
+                          </div>
                         </div>
-                      </div>
-                    ))}
-                  </div>
+                      ))}
+                    </div>
 
-                  {/* Keterangan Jam Ke-1 & Aturan Presensi Pribadi */}
-                  <div className="p-2 bg-slate-100/70 rounded-lg text-[10px] text-slate-600 leading-relaxed border border-slate-200">
-                    <p className="font-semibold text-slate-800 mb-0.5">
-                      📌 {viewingScheduleEval.jamSatuKeterangan}
-                    </p>
-                    <p className="text-slate-500">
-                      {resolvedRule.ruleMode === 'sesuai_jadwal' ? (
-                        <>
-                          Aturan Presensi ({teacherPeran}): Batas hadir tepat waktu hari {viewingHari} adalah{' '}
-                          <strong className="text-slate-800">
-                            {minutesToTime(Math.max(0, (timeToMinutes(viewingScheduleEval.firstScheduleTime || '07:30') ?? 450) - (settings.guruToleransiMenit || 0)))} WIB
-                          </strong>{' '}
-                          (sesuai jadwal jam masuk kelas pertama).
-                        </>
+                    {/* Keterangan Jam Ke-1 & Aturan Presensi Pribadi */}
+                    <div className="p-2 bg-slate-100/70 rounded-lg text-[10px] text-slate-600 leading-relaxed border border-slate-200">
+                      <p className="font-semibold text-slate-800 mb-0.5">
+                        📌 {viewingScheduleEval.jamSatuKeterangan}
+                      </p>
+                      <p className="text-slate-500">
+                        {resolvedRule.ruleMode === 'sesuai_jadwal' ? (
+                          <>
+                            Aturan Presensi ({teacherPeran}): Batas hadir tepat waktu hari {viewingHari} adalah{' '}
+                            <strong className="text-slate-800">
+                              {minutesToTime(Math.max(0, (timeToMinutes(viewingScheduleEval.firstScheduleTime || '07:30') ?? 450) - (settings.guruToleransiMenit || 0)))} WIB
+                            </strong>{' '}
+                            (sesuai jadwal jam masuk kelas pertama).
+                          </>
+                        ) : resolvedRule.isGuruBk ? (
+                          <>
+                            Aturan Guru BK: Wajib hadir harian maksimal <strong className="text-slate-800">{batasStaf} WIB</strong>
+                            {viewingScheduleEval.firstScheduleTime && ` & batas sesi mengajar pertama ${viewingScheduleEval.firstScheduleTime} WIB`}.
+                          </>
+                        ) : (
+                          <>
+                            Aturan Staf/Jabatan: Wajib hadir harian maksimal <strong className="text-slate-800">{batasStaf} WIB</strong>
+                            {viewingScheduleEval.firstScheduleTime && ` & batas sesi mengajar pertama ${viewingScheduleEval.firstScheduleTime} WIB`}.
+                          </>
+                        )}
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-center">
+                    <p className="text-slate-600 italic">
+                      {isJadwalTidakDitemukan(teacher) ? (
+                        <span className="text-amber-800 text-[10.5px] not-italic font-medium">
+                          Jadwal belum terhubung (Kode Guru belum diisi di Master_Guru_Staf)
+                        </span>
                       ) : resolvedRule.isGuruBk ? (
-                        <>
-                          Aturan Guru BK: Wajib hadir harian maksimal <strong className="text-slate-800">{batasStaf} WIB</strong>
-                          {viewingScheduleEval.firstScheduleTime && ` & batas sesi mengajar pertama ${viewingScheduleEval.firstScheduleTime} WIB`}.
-                        </>
+                        'Tugas Bimbingan & Konseling (Wajib Hadir sebagai Guru BK).'
+                      ) : teacher.jabatan.toLowerCase().includes('guru') ? (
+                        `Hari ${viewingHari} tidak ada jam tatap muka di kelas.`
                       ) : (
-                        <>
-                          Aturan Staf/Jabatan: Wajib hadir harian maksimal <strong className="text-slate-800">{batasStaf} WIB</strong>
-                          {viewingScheduleEval.firstScheduleTime && ` & batas sesi mengajar pertama ${viewingScheduleEval.firstScheduleTime} WIB`}.
-                        </>
+                        'Tugas operasional kantor / ketatausahaan sekolah.'
                       )}
                     </p>
                   </div>
-                </div>
-              ) : (
-                <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-center">
-                  <p className="text-slate-600 italic">
-                    {isJadwalTidakDitemukan(teacher) ? (
-                      <span className="text-amber-800 text-[10.5px] not-italic font-medium">
-                        Jadwal belum terhubung (Kode Guru belum diisi di Master_Guru_Staf)
-                      </span>
-                    ) : resolvedRule.isGuruBk ? (
-                      'Tugas Bimbingan & Konseling (Wajib Hadir sebagai Guru BK).'
-                    ) : teacher.jabatan.toLowerCase().includes('guru') ? (
-                      `Hari ${viewingHari} tidak ada jam tatap muka di kelas.`
-                    ) : (
-                      'Tugas operasional kantor / ketatausahaan sekolah.'
-                    )}
-                  </p>
+                )
+              )}
+
+              {/* Jadwal Mengajar Guru Yang Digantikan (khusus Guru Pengganti) */}
+              {substitutedSchedulesForViewingDay.length > 0 && (
+                <div className="p-3 bg-purple-50/80 rounded-xl border border-purple-200 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2 border-b border-purple-200/80 pb-1.5">
+                    <span className="font-extrabold text-purple-900 uppercase tracking-wider text-[10px]">
+                      Jadwal Tugas Pengganti ({viewingHari})
+                    </span>
+                    <span className="px-2 py-0.5 bg-purple-200 text-purple-950 rounded-md text-[9.5px] font-black">
+                      Dari Guru Cuti
+                    </span>
+                  </div>
+
+                  {substitutedSchedulesForViewingDay.map((group, gIdx) => (
+                    <div key={gIdx} className="space-y-1.5">
+                      <div className="flex flex-wrap items-center justify-between gap-1 text-[10.5px]">
+                        <span className="font-bold text-purple-950">
+                          Menggantikan: {group.assignment.guruCutiNama}
+                          {group.assignment.classNote ? ` (${group.assignment.classNote})` : ''}
+                        </span>
+                        {group.isClassFiltered && (
+                          <span className="text-[9.5px] font-bold px-1.5 py-0.5 bg-white text-purple-800 rounded border border-purple-200">
+                            Difilter {group.assignment.classNote}
+                          </span>
+                        )}
+                      </div>
+
+                      {group.matchedSesiList.length > 0 ? (
+                        <div className="grid grid-cols-1 gap-1.5">
+                          {group.matchedSesiList.map((sesi, sIdx) => (
+                            <div
+                              key={sIdx}
+                              className="flex items-center justify-between p-2 bg-white rounded-xl border border-purple-200/90 shadow-2xs"
+                            >
+                              <div className="flex items-center gap-2 min-w-0">
+                                <span className="px-2 py-0.5 rounded-md text-[10px] font-black shrink-0 bg-purple-100 text-purple-900 border border-purple-300">
+                                  {sesi.labelJam}
+                                </span>
+                                <span className="font-extrabold text-slate-800 text-[11.5px] truncate">
+                                  {sesi.namaMapel}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                {sesi.kelas && sesi.kelas !== '-' && (
+                                  <span className="font-black text-purple-900 bg-purple-100 border border-purple-200 px-2 py-0.5 rounded-md text-[10.5px]">
+                                    {sesi.kelas}
+                                  </span>
+                                )}
+                                <span className="text-[9.5px] text-slate-600 font-mono font-bold bg-slate-50 px-1.5 py-0.5 rounded border border-slate-200">
+                                  {sesi.jamMulai} - {sesi.jamSelesai} WIB
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-[10.5px] text-purple-800 italic bg-white/70 px-2.5 py-1.5 rounded-lg border border-purple-100">
+                          {group.assignment.guruCutiNama} tidak memiliki jam mengajar pada hari {viewingHari}.
+                        </p>
+                      )}
+                    </div>
+                  ))}
                 </div>
               )}
 
@@ -894,6 +1317,14 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
                     </div>
                     {(['Sabtu', 'Ahad', 'Senin', 'Selasa', 'Rabu', 'Kamis'] as HariSekolah[]).map(day => {
                       const dayEval = evaluateTeacherScheduleForDay(teacher, day, settings.jamMasukThreshold || '07:25', jadwalList, settings.attendanceRuleOverrides);
+                      const subGroupsOnDay = getSubstitutedSchedulesForDay({
+                        teacher,
+                        masterList,
+                        hari: day,
+                        threshold: settings.jamMasukThreshold || '07:25',
+                        jadwalList,
+                        attendanceRuleOverrides: settings.attendanceRuleOverrides
+                      }).filter((g) => g.matchedSesiList.length > 0);
                       return (
                         <div
                           key={day}
@@ -903,15 +1334,29 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
                           }`}
                         >
                           <span className="w-12 shrink-0 font-bold text-slate-800">{day}:</span>
-                          <span className="flex-1 text-slate-600 text-[10px]">
-                            {isJadwalTidakDitemukan(teacher) ? (
-                              <em className="text-amber-700">Jadwal belum terhubung (Kode Guru belum diisi di Master_Guru_Staf)</em>
-                            ) : dayEval.hasTeachingSchedule ? (
-                              dayEval.mapelHariIni
-                            ) : (
-                              <em className="text-slate-400">Libur mengajar</em>
+                          <div className="flex-1 text-slate-600 text-[10px] space-y-0.5">
+                            {!teacher.isTempSubstitute && (
+                              <div>
+                                {isJadwalTidakDitemukan(teacher) ? (
+                                  <em className="text-amber-700">Jadwal belum terhubung (Kode Guru belum diisi di Master_Guru_Staf)</em>
+                                ) : dayEval.hasTeachingSchedule ? (
+                                  dayEval.mapelHariIni
+                                ) : (
+                                  <em className="text-slate-400">Libur mengajar</em>
+                                )}
+                              </div>
                             )}
-                          </span>
+                            {subGroupsOnDay.length > 0 ? (
+                              subGroupsOnDay.map((sg, sgIdx) => (
+                                <div key={sgIdx} className="text-purple-800 font-semibold">
+                                  {teacher.isTempSubstitute ? 'Pengganti' : '+ Pengganti'} ({sg.assignment.guruCutiNama}):{' '}
+                                  {sg.matchedSesiList.map((s) => `${s.labelJam} ${s.namaMapel} (${s.kelas})`).join(', ')}
+                                </div>
+                              ))
+                            ) : teacher.isTempSubstitute ? (
+                              <em className="text-slate-400">Tidak ada jadwal pengganti</em>
+                            ) : null}
+                          </div>
                         </div>
                       );
                     })}
@@ -1149,72 +1594,209 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
 
       {/* 4. Tombol Utama Presensi (Sangat Jelas & Besar) */}
       <div className="space-y-3 pt-1">
-        {todayLog ? (
-          /* Already attended view */
-          <div className="bg-emerald-50 border-2 border-emerald-500 rounded-3xl p-5 text-center shadow-md">
-            <div className="w-12 h-12 rounded-full bg-emerald-600 text-white flex items-center justify-center mx-auto mb-2 shadow">
-              <CheckCircle2 className="w-7 h-7" />
+        {(activeCutiToday || todayLog?.status === 'Cuti') ? (
+          <div className="bg-teal-50 border-2 border-teal-500 rounded-3xl p-5 text-center shadow-md space-y-2.5">
+            <div className="w-12 h-12 rounded-full bg-teal-600 text-white flex items-center justify-center mx-auto shadow">
+              <CalendarDays className="w-7 h-7" />
             </div>
-            <h3 className="text-base font-black text-emerald-900">
-              Presensi Hari Ini Telah Tercatat
+            <h3 className="text-base font-black text-teal-950">
+              Anda Masih Dalam Masa Cuti Resmi
             </h3>
-            <div className="flex items-center justify-center gap-2 mt-1.5 flex-wrap">
-              <span className="text-xs text-emerald-900 font-black">
-                {teacher?.nama}
-              </span>
-              <span className="text-xs text-slate-500">&bull;</span>
-              <span className="text-xs text-emerald-800 font-bold">
-                Jam {todayLog.jamDatang} WIB
-              </span>
-              <span
-                className={`text-[11px] px-2.5 py-0.5 rounded-full font-black ${
-                  todayLog.status === 'Tepat Waktu'
-                    ? 'bg-emerald-200 text-emerald-900'
-                    : 'bg-amber-200 text-amber-900'
-                }`}
-              >
-                {todayLog.status}
+            <div className="flex items-center justify-center gap-2 flex-wrap">
+              <span className="text-xs text-teal-950 font-black">{teacher?.nama}</span>
+              <span className="text-[11px] px-2.5 py-0.5 rounded-full font-black bg-teal-200 text-teal-900">
+                {activeCutiToday?.jenisCuti || 'Cuti Resmi'} (Non-Pelanggaran)
               </span>
             </div>
-            <p className="text-[11px] text-slate-500 mt-1">
-              Batas Presensi Anda: <strong>{effectiveTodayThreshold} WIB</strong>
-              {expectedEval?.peran ? ` (${expectedEval.peran})` : ''}
-            </p>
-
-            {/* Auto Correction Button if previously misflagged as Terlambat */}
-            {isStatusMismatched && (
-              <div className="mt-3 p-3 bg-amber-50 border border-amber-300 rounded-2xl text-left">
-                <p className="text-xs font-bold text-amber-900 flex items-center gap-1.5">
-                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-                  <span>Koreksi Otomatis Jam Masuk ({effectiveTodayThreshold} WIB):</span>
-                </p>
-                <p className="text-[11px] text-amber-800 mt-1">
-                  Jam kedatangan Anda <strong>{todayLog.jamDatang} WIB</strong> tercatat sebelum batas <strong>{effectiveTodayThreshold} WIB</strong>. Anda berhak berstatus <strong>Tepat Waktu</strong>.
-                </p>
-                <button
-                  onClick={handleCorrectStatus}
-                  disabled={isSubmitting}
-                  className="mt-2.5 w-full py-2.5 px-3 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-sm active:scale-98"
-                >
-                  {isSubmitting ? (
-                    <>
-                      <RefreshCw className="w-4 h-4 animate-spin" />
-                      <span>Memperbarui Status...</span>
-                    </>
-                  ) : (
-                    <>
-                      <CheckCircle2 className="w-4 h-4" />
-                      <span>Koreksi Status Menjadi "Tepat Waktu"</span>
-                    </>
-                  )}
-                </button>
-              </div>
+            {activeCutiToday && (
+              <p className="text-xs font-bold text-teal-900">
+                Periode: {formatLongDateIndonesian(activeCutiToday.tanggalMulai)} s/d {formatLongDateIndonesian(activeCutiToday.tanggalSelesai)}
+                {activeCutiToday.guruPengganti && activeCutiToday.guruPengganti !== '-' && (
+                  <> &bull; Pengganti: <span className="underline">{activeCutiToday.guruPengganti}</span></>
+                )}
+              </p>
             )}
-
-            <p className="text-[11px] text-emerald-600 mt-2">
-              Data kehadiran Anda sudah tersinkronisasi ke Google Sheets sekolah.
-            </p>
+            {(todayLog?.keterangan || activeCutiToday?.catatan) && (
+              <p className="text-[11px] text-teal-800 bg-white/80 border border-teal-200 rounded-xl px-3 py-2">
+                {todayLog?.keterangan || activeCutiToday?.catatan}
+              </p>
+            )}
+            <div className="bg-amber-50 border border-amber-300 rounded-2xl p-3 text-left text-[11.5px] text-amber-950 flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <p className="leading-relaxed">
+                <strong>Sudah masuk sekolah &amp; siap aktif kembali?</strong> Harap <strong>lapor diri ke TU / Admin terlebih dahulu</strong> untuk mencabut atau menyelesaikan status cuti Anda di sistem sebelum mengisi presensi kehadiran.
+              </p>
+            </div>
           </div>
+        ) : todayLog ? (
+          (todayLog.status || '').startsWith('Alpa') ? (
+            <div className="bg-rose-50 border-2 border-rose-500 rounded-3xl p-5 text-center shadow-md space-y-2">
+              <div className="w-12 h-12 rounded-full bg-rose-600 text-white flex items-center justify-center mx-auto shadow">
+                <XCircle className="w-7 h-7" />
+              </div>
+              <h3 className="text-base font-black text-rose-900">
+                Tercatat Tidak Hadir (Alpa)
+              </h3>
+              <div className="flex items-center justify-center gap-2 flex-wrap">
+                <span className="text-xs text-rose-950 font-black">
+                  {teacher?.nama}
+                </span>
+                <span className="text-[11px] px-2.5 py-0.5 rounded-full font-black bg-rose-200 text-rose-900">
+                  {todayLog.status}
+                </span>
+              </div>
+              {todayLog.keterangan && (
+                <p className="text-[11px] text-rose-800 bg-white/80 border border-rose-200 rounded-xl px-3 py-2 leading-relaxed">
+                  {todayLog.keterangan}
+                </p>
+              )}
+              <p className="text-[11px] text-rose-700">
+                Batas waktu pengisian presensi wajib hadir telah lewat. Hubungi Admin atau Waka Kurikulum apabila Anda memiliki tugas luar/izin/cuti resmi.
+              </p>
+            </div>
+          ) : todayLog.status === 'Izin' || todayLog.status === 'Sakit' || todayLog.status === 'Dinas Luar' ? (
+            (() => {
+              const parsedKet = parseAbsenceKeterangan(todayLog.keterangan);
+              const waMsg = buildAbsenceWaMessage({
+                status: todayLog.status,
+                reason: parsedKet.reason || todayLog.keterangan || '-',
+                task: parsedKet.task,
+                jadwalText: todayLog.mapelHariIni && todayLog.mapelHariIni !== '-' ? todayLog.mapelHariIni : todayScheduleSummaryText
+              });
+              return (
+                <div className="bg-sky-50 border-2 border-sky-500 rounded-3xl p-5 text-center shadow-md space-y-3">
+                  <div className="w-12 h-12 rounded-full bg-sky-600 text-white flex items-center justify-center mx-auto shadow">
+                    <Clock className="w-7 h-7" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-black text-sky-900">
+                      Status Hari Ini: {todayLog.status}
+                    </h3>
+                    <p className="text-xs text-sky-950 font-bold mt-0.5">{teacher?.nama}</p>
+                  </div>
+
+                  {parsedKet.reason && (
+                    <div className="text-left text-[11.5px] text-sky-900 bg-white/90 border border-sky-200 rounded-xl px-3 py-2">
+                      <span className="font-extrabold text-sky-800 block text-[10px] uppercase">Alasan / Keterangan:</span>
+                      <span>{parsedKet.reason}</span>
+                    </div>
+                  )}
+
+                  {parsedKet.task && (
+                    <div className="text-left text-[11.5px] text-amber-950 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2">
+                      <span className="font-extrabold text-amber-900 block text-[10px] uppercase">Tugas untuk Siswa:</span>
+                      <span>{parsedKet.task}</span>
+                    </div>
+                  )}
+
+                  {/* Kirim / Salin Info ke Grup WA Sekolah */}
+                  <div className="pt-2 border-t border-sky-200/80 space-y-2 text-left">
+                    <p className="text-[10.5px] font-bold text-sky-900 text-center">
+                      Kirim Keterangan &amp; Tugas ke Grup WhatsApp Resmi Sekolah:
+                    </p>
+                    <div className="grid grid-cols-1 gap-2">
+                      <a
+                        href={waGroupUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={() => handleCopyWaMessage(waMsg)}
+                        className="w-full py-2.5 px-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-2xl text-xs font-extrabold flex items-center justify-center gap-2 shadow-sm transition active:scale-98"
+                      >
+                        <MessageSquare className="w-4 h-4 shrink-0" />
+                        <span>{waCopied ? '✓ Teks Tersalin! Tempel di Grup WA Sekolah' : 'Salin Pesan & Buka Grup WA Sekolah'}</span>
+                        <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                      </a>
+                      <div className="grid grid-cols-2 gap-2">
+                        <a
+                          href={`https://api.whatsapp.com/send?text=${encodeURIComponent(waMsg)}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="py-2 px-2.5 bg-white hover:bg-emerald-50 text-emerald-800 border border-emerald-300 rounded-xl text-[11px] font-bold flex items-center justify-center gap-1.5 transition"
+                        >
+                          <Send className="w-3.5 h-3.5 shrink-0" />
+                          <span>Pilih Grup di WA</span>
+                        </a>
+                        <button
+                          type="button"
+                          onClick={() => handleCopyWaMessage(waMsg)}
+                          className="py-2 px-2.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-xl text-[11px] font-bold flex items-center justify-center gap-1.5 transition cursor-pointer"
+                        >
+                          <Copy className="w-3.5 h-3.5 shrink-0" />
+                          <span>{waCopied ? 'Tersalin!' : 'Salin Teks Saja'}</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()
+          ) : (
+            /* Already attended view (Tepat Waktu / Terlambat) */
+            <div className="bg-emerald-50 border-2 border-emerald-500 rounded-3xl p-5 text-center shadow-md">
+              <div className="w-12 h-12 rounded-full bg-emerald-600 text-white flex items-center justify-center mx-auto mb-2 shadow">
+                <CheckCircle2 className="w-7 h-7" />
+              </div>
+              <h3 className="text-base font-black text-emerald-900">
+                Presensi Hari Ini Telah Tercatat
+              </h3>
+              <div className="flex items-center justify-center gap-2 mt-1.5 flex-wrap">
+                <span className="text-xs text-emerald-900 font-black">
+                  {teacher?.nama}
+                </span>
+                <span className="text-xs text-slate-500">&bull;</span>
+                <span className="text-xs text-emerald-800 font-bold">
+                  Jam {todayLog.jamDatang} WIB
+                </span>
+                <span
+                  className={`text-[11px] px-2.5 py-0.5 rounded-full font-black ${
+                    todayLog.status === 'Tepat Waktu'
+                      ? 'bg-emerald-200 text-emerald-900'
+                      : 'bg-amber-200 text-amber-900'
+                  }`}
+                >
+                  {todayLog.status}
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-500 mt-1">
+                Batas Presensi Anda: <strong>{effectiveTodayThreshold} WIB</strong>
+                {expectedEval?.peran ? ` (${expectedEval.peran})` : ''}
+              </p>
+
+              {/* Auto Correction Button if previously misflagged as Terlambat */}
+              {isStatusMismatched && (
+                <div className="mt-3 p-3 bg-amber-50 border border-amber-300 rounded-2xl text-left">
+                  <p className="text-xs font-bold text-amber-900 flex items-center gap-1.5">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                    <span>Koreksi Otomatis Jam Masuk ({effectiveTodayThreshold} WIB):</span>
+                  </p>
+                  <p className="text-[11px] text-amber-800 mt-1">
+                    Jam kedatangan Anda <strong>{todayLog.jamDatang} WIB</strong> tercatat sebelum batas <strong>{effectiveTodayThreshold} WIB</strong>. Anda berhak berstatus <strong>Tepat Waktu</strong>.
+                  </p>
+                  <button
+                    onClick={handleCorrectStatus}
+                    disabled={isSubmitting}
+                    className="mt-2.5 w-full py-2.5 px-3 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-sm active:scale-98"
+                  >
+                    {isSubmitting ? (
+                      <>
+                        <RefreshCw className="w-4 h-4 animate-spin" />
+                        <span>Memperbarui Status...</span>
+                      </>
+                    ) : (
+                      <>
+                        <CheckCircle2 className="w-4 h-4" />
+                        <span>Koreksi Status Menjadi "Tepat Waktu"</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              )}
+
+              <p className="text-[11px] text-emerald-600 mt-2">
+                Data kehadiran Anda sudah tersinkronisasi ke Google Sheets sekolah.
+              </p>
+            </div>
+          )
         ) : (
           <>
             {/* Warning & Solution if outside school radius */}
@@ -1279,6 +1861,32 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
               <Camera className="w-4 h-4 text-[#2F5597]" />
               <span>Opsi Lain: Buka Kamera Scan Poster Gerbang</span>
             </button>
+
+            {/* Remote Absence Card: Izin / Sakit / Dinas Luar dari Rumah (Tanpa GPS) */}
+            <div className="pt-2">
+              <div className="bg-sky-50/90 border border-sky-200 rounded-3xl p-4 space-y-2.5 text-left">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <p className="text-xs font-black text-sky-950">
+                      Berhalangan Hadir Hari Ini? (Izin / Sakit / Dinas Luar)
+                    </p>
+                    <p className="text-[10.5px] text-sky-800 leading-relaxed mt-0.5">
+                      Validasi GPS hanya berlaku saat presensi hadir di sekolah. Jika Anda sedang di rumah / sakit / tugas luar, ajukan di sini beserta <strong>tugas untuk siswa</strong> &amp; kirim ke <strong>Grup WA Sekolah</strong>.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  id="btn-ajukan-izin-dari-rumah"
+                  disabled={!teacher || isSubmitting}
+                  onClick={() => handleOpenAbsenceModal('Izin')}
+                  className="w-full py-3 px-4 bg-sky-600 hover:bg-sky-700 disabled:bg-slate-200 disabled:text-slate-400 text-white rounded-2xl font-extrabold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-sm transition active:scale-98 cursor-pointer"
+                >
+                  <FileText className="w-4 h-4 shrink-0" />
+                  <span>Ajukan Izin / Sakit / Dinas Luar (Dari Rumah)</span>
+                </button>
+              </div>
+            </div>
           </>
         )}
       </div>
@@ -1506,6 +2114,331 @@ export const MobileSelfPresensi: React.FC<MobileSelfPresensiProps> = ({
               isModal={true}
               onClose={() => setShowClassSchedulesModal(false)}
             />
+          </div>
+        </div>
+      )}
+
+      {/* Modal Pengajuan Izin / Sakit / Dinas Luar dari Rumah (Tanpa GPS) + Kirim WA Sekolah */}
+      {showAbsenceModal && teacher && (
+        <div className="fixed inset-0 z-50 bg-slate-900/70 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
+          <div className="bg-white rounded-3xl w-full max-w-md border border-slate-200 shadow-2xl p-5 space-y-4 my-auto max-h-[92vh] overflow-y-auto relative">
+            <button
+              type="button"
+              onClick={() => setShowAbsenceModal(false)}
+              className="absolute top-3.5 right-3.5 p-1.5 text-slate-400 hover:text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-full transition cursor-pointer"
+              aria-label="Tutup modal pengajuan ketidakhadiran"
+            >
+              <X className="w-4 h-4" />
+            </button>
+
+            {!absenceSavedLog ? (
+              <form onSubmit={handleSubmitRemoteAbsence} className="space-y-4">
+                <div className="pr-8">
+                  <div className="flex items-center gap-2">
+                    <div className="w-9 h-9 rounded-2xl bg-sky-100 text-sky-700 flex items-center justify-center shrink-0">
+                      <FileText className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm sm:text-base font-black text-slate-900 leading-tight">
+                        Pengajuan Izin / Sakit / Dinas Luar
+                      </h3>
+                      <p className="text-[11px] font-bold text-sky-700">
+                        Dari Rumah &bull; Tanpa Validasi GPS
+                      </p>
+                    </div>
+                  </div>
+                  <p className="text-[11px] text-slate-600 mt-2 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2">
+                    Pemohon: <strong className="text-slate-900">{teacher.nama}</strong> ({teacher.jabatan}) &bull; {hariIni}, {formatLongDateIndonesian(todayISO)}
+                  </p>
+                </div>
+
+                {/* Pilihan Jenis Ketidakhadiran */}
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-extrabold text-slate-800">
+                    1. Pilih Jenis Ketidakhadiran:
+                  </label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {(['Izin', 'Sakit', 'Dinas Luar'] as const).map((jenis) => {
+                      const isActive = absenceType === jenis;
+                      const activeStyle =
+                        jenis === 'Izin'
+                          ? 'bg-sky-600 text-white border-sky-600 shadow-sm'
+                          : jenis === 'Sakit'
+                          ? 'bg-amber-600 text-white border-amber-600 shadow-sm'
+                          : 'bg-indigo-600 text-white border-indigo-600 shadow-sm';
+                      return (
+                        <button
+                          key={jenis}
+                          type="button"
+                          onClick={() => {
+                            setAbsenceType(jenis);
+                            setAbsenceError('');
+                          }}
+                          className={`py-2.5 px-2 rounded-xl text-xs font-extrabold border transition cursor-pointer ${
+                            isActive
+                              ? activeStyle
+                              : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
+                          }`}
+                        >
+                          {jenis}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Pengingat Kuota Ketidakhadiran Sekolah */}
+                {(() => {
+                  const selectedUsed =
+                    absenceType === 'Izin'
+                      ? teacherQuotaSummary.izin
+                      : absenceType === 'Sakit'
+                      ? teacherQuotaSummary.sakit
+                      : teacherQuotaSummary.dinas;
+                  const selectedMax =
+                    absenceType === 'Izin'
+                      ? teacherQuotaSummary.maxIzin
+                      : absenceType === 'Sakit'
+                      ? teacherQuotaSummary.maxSakit
+                      : teacherQuotaSummary.maxDinas;
+                  const isLimitReached = selectedMax > 0 && selectedUsed >= selectedMax;
+                  const remaining = Math.max(0, selectedMax - selectedUsed);
+
+                  return (
+                    <div
+                      className={`rounded-2xl p-3 border text-xs space-y-1.5 ${
+                        isLimitReached
+                          ? 'bg-rose-50 border-rose-300 text-rose-900'
+                          : 'bg-slate-50 border-slate-200 text-slate-800'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-extrabold text-[11px]">
+                          Aturan Batas {absenceType} ({teacherQuotaSummary.periodLabel}):
+                        </span>
+                        <span
+                          className={`font-black text-[11px] px-2 py-0.5 rounded-lg ${
+                            isLimitReached
+                              ? 'bg-rose-200 text-rose-950'
+                              : 'bg-emerald-100 text-emerald-900'
+                          }`}
+                        >
+                          Terpakai {selectedUsed} / {selectedMax} &bull; Sisa {remaining}
+                        </span>
+                      </div>
+                      <p className="text-[10.5px] text-slate-600 leading-relaxed">
+                        Batas resmi sekolah ({teacherQuotaSummary.periodeMode}): Izin maks{' '}
+                        <strong>{teacherQuotaSummary.maxIzin}x</strong>, Sakit maks{' '}
+                        <strong>{teacherQuotaSummary.maxSakit}x</strong>, Dinas Luar maks{' '}
+                        <strong>{teacherQuotaSummary.maxDinas}x</strong>, Alpa maks{' '}
+                        <strong>{teacherQuotaSummary.maxAlpa}x</strong>.
+                      </p>
+                      {isLimitReached && (
+                        <p className="text-[10.5px] font-bold text-rose-800 flex items-start gap-1.5 pt-0.5">
+                          <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-rose-600" />
+                          <span>
+                            Perhatian: Kuota {absenceType} Anda pada periode ini telah mencapai/melebihi batas maksimal sekolah. Pengajuan tetap dicatat agar transparan dan terhitung dalam pembinaan.
+                          </span>
+                        </p>
+                      )}
+                    </div>
+                  );
+                })()}
+
+                {/* Jadwal Mengajar Hari Ini & Kolom Tugas untuk Siswa */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-extrabold text-slate-800 flex items-center gap-1.5">
+                      <BookOpen className="w-3.5 h-3.5 text-blue-600" />
+                      <span>
+                        {hasAnyTeachingToday
+                          ? '2. Tugas untuk Siswa (Wajib Ada Jadwal Hari Ini):'
+                          : '2. Catatan / Titipan Tugas Piket (Opsional):'}
+                      </span>
+                    </label>
+                    {hasAnyTeachingToday && (
+                      <span className="text-[10px] font-black px-2 py-0.5 rounded-md bg-amber-100 text-amber-900">
+                        {todayTeachingSessions.length} Sesi Mengajar
+                      </span>
+                    )}
+                  </div>
+
+                  {hasAnyTeachingToday ? (
+                    <div className="bg-amber-50/80 border border-amber-200 rounded-2xl p-2.5 space-y-1.5">
+                      <p className="text-[10.5px] font-bold text-amber-950">
+                        Jadwal Mengajar Anda Hari Ini ({hariIni}):
+                      </p>
+                      <div className="space-y-1 max-h-28 overflow-y-auto">
+                        {todayTeachingSessions.map((sesi, idx) => (
+                          <div
+                            key={`${sesi.labelJam}-${sesi.kelas}-${idx}`}
+                            className="text-[10.5px] bg-white border border-amber-200/80 rounded-lg px-2 py-1 flex items-center justify-between gap-2"
+                          >
+                            <span className="font-bold text-slate-800">
+                              {sesi.labelJam} &bull; {sesi.namaMapel} ({sesi.kelas})
+                              {sesi.guruCutiNama ? ` [Pengganti ${sesi.guruCutiNama}]` : ''}
+                            </span>
+                            <span className="text-[10px] font-mono text-slate-500 shrink-0">
+                              {sesi.jamMulai}-{sesi.jamSelesai}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="text-[10.5px] text-slate-500 bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5">
+                      Anda tidak memiliki jadwal mengajar tatap muka hari ini ({hariIni}).
+                    </p>
+                  )}
+
+                  <textarea
+                    rows={3}
+                    value={absenceTask}
+                    onChange={(e) => {
+                      setAbsenceTask(e.target.value);
+                      if (absenceError) setAbsenceError('');
+                    }}
+                    placeholder={
+                      hasAnyTeachingToday
+                        ? 'Contoh: Kelas 8A kerjakan LKS hal. 24-25 no. 1-10, dikumpulkan ke Ketua Kelas / Guru Piket...'
+                        : 'Opsional: tuliskan titipan pesan atau tugas bila ada...'
+                    }
+                    className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-300 rounded-2xl text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-sky-500"
+                  />
+                </div>
+
+                {/* Alasan / Keterangan */}
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-extrabold text-slate-800">
+                    3. Alasan / Keterangan {absenceType} (Wajib):
+                  </label>
+                  <textarea
+                    rows={2}
+                    value={absenceReason}
+                    onChange={(e) => {
+                      setAbsenceReason(e.target.value);
+                      if (absenceError) setAbsenceError('');
+                    }}
+                    placeholder={`Tuliskan alasan singkat ${absenceType.toLowerCase()} Anda hari ini...`}
+                    className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-300 rounded-2xl text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-sky-500"
+                  />
+                </div>
+
+                {absenceError && (
+                  <div className="p-3 bg-rose-50 border border-rose-300 rounded-2xl text-xs font-bold text-rose-800 flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                    <span>{absenceError}</span>
+                  </div>
+                )}
+
+                <div className="flex gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => setShowAbsenceModal(false)}
+                    className="w-1/3 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-2xl transition cursor-pointer"
+                  >
+                    Batal
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isSubmittingAbsence}
+                    className="w-2/3 py-3 bg-sky-600 hover:bg-sky-700 disabled:opacity-60 text-white font-black text-xs rounded-2xl shadow-md transition flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    {isSubmittingAbsence ? (
+                      <>
+                        <RefreshCw className="w-4 h-4 animate-spin" />
+                        <span>Menyimpan...</span>
+                      </>
+                    ) : (
+                      <>
+                        <CheckCircle2 className="w-4 h-4" />
+                        <span>Simpan &amp; Siapkan Pesan WA</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </form>
+            ) : (
+              (() => {
+                const waMsg = buildAbsenceWaMessage({
+                  status: absenceSavedLog.status,
+                  reason: absenceReason.trim(),
+                  task: absenceTask.trim(),
+                  jadwalText: todayScheduleSummaryText
+                });
+
+                return (
+                  <div className="space-y-4">
+                    <div className="text-center space-y-1.5 pr-4">
+                      <div className="w-12 h-12 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center mx-auto">
+                        <CheckCircle2 className="w-7 h-7" />
+                      </div>
+                      <h3 className="text-base font-black text-slate-900">
+                        Pengajuan {absenceSavedLog.status} Tercatat!
+                      </h3>
+                      <p className="text-[11px] text-slate-600">
+                        Silakan teruskan laporan ketidakhadiran &amp; tugas siswa ini ke Grup WhatsApp Resmi Sekolah:
+                      </p>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <span className="text-[10.5px] font-extrabold text-slate-500 uppercase">
+                        Pratinjau Pesan WhatsApp:
+                      </span>
+                      <pre className="whitespace-pre-wrap font-sans text-[11px] leading-relaxed bg-slate-50 border border-slate-200 rounded-2xl p-3 text-slate-800 max-h-52 overflow-y-auto">
+                        {waMsg}
+                      </pre>
+                    </div>
+
+                    <div className="space-y-2">
+                      <a
+                        href={waGroupUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={() => handleCopyWaMessage(waMsg)}
+                        className="w-full py-3 px-4 bg-emerald-600 hover:bg-emerald-700 text-white rounded-2xl text-xs font-black flex items-center justify-center gap-2 shadow-md transition active:scale-98"
+                      >
+                        <MessageSquare className="w-4 h-4 shrink-0" />
+                        <span>
+                          {waCopied
+                            ? '✓ Teks Tersalin! Tempel di Grup WA Sekolah'
+                            : 'Salin Pesan & Buka Grup WA Sekolah'}
+                        </span>
+                        <ExternalLink className="w-3.5 h-3.5 shrink-0" />
+                      </a>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <a
+                          href={`https://api.whatsapp.com/send?text=${encodeURIComponent(waMsg)}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="py-2.5 px-3 bg-white hover:bg-emerald-50 text-emerald-800 border border-emerald-300 rounded-xl text-[11px] font-bold flex items-center justify-center gap-1.5 transition"
+                        >
+                          <Send className="w-3.5 h-3.5 shrink-0" />
+                          <span>Pilih Grup di WA</span>
+                        </a>
+                        <button
+                          type="button"
+                          onClick={() => handleCopyWaMessage(waMsg)}
+                          className="py-2.5 px-3 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-xl text-[11px] font-bold flex items-center justify-center gap-1.5 transition cursor-pointer"
+                        >
+                          <Copy className="w-3.5 h-3.5 shrink-0" />
+                          <span>{waCopied ? 'Tersalin!' : 'Salin Teks Saja'}</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => setShowAbsenceModal(false)}
+                      className="w-full py-2.5 bg-[#2F5597] hover:bg-[#234278] text-white font-bold text-xs rounded-2xl shadow transition cursor-pointer"
+                    >
+                      Selesai / Tutup
+                    </button>
+                  </div>
+                );
+              })()
+            )}
           </div>
         </div>
       )}

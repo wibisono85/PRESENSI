@@ -14,23 +14,24 @@ import {
   FileSpreadsheet,
   Edit3
 } from 'lucide-react';
-import { MasterGuruStaf, LogPresensi, StatusPresensi, HariSekolah, AppSettings, JadwalSlot } from '../types';
+import { MasterGuruStaf, LogPresensi, StatusPresensi, HariSekolah, AppSettings, JadwalSlot, DataCutiRecord } from '../types';
 import {
   formatDateISO,
   getHariFromDate,
   formatLongDateIndonesian,
   getMapelHariIni,
-  filterTeachersForDay,
   formatTimestamp,
   isJumat
 } from '../utils/dateUtils';
 import { evaluateStatus24h, parseAndFormat24hTime } from '../utils/timeUtils';
 import { evaluateTeacherScheduleForDay, evaluateTeacherAttendanceStatus, isTeacherWajibHadir } from '../utils/scheduleTimeEvaluator';
+import { buildEffectiveAttendanceRoster, formatSubstituteAttendanceNote, getSubstitutedSchedulesForDay } from '../utils/cutiUtils';
 import { Time24hInput } from './Time24hInput';
 
 interface InputMassalProps {
   masterList: MasterGuruStaf[];
   existingLogs: LogPresensi[];
+  cutiList?: DataCutiRecord[];
   threshold: string;
   onBatchSave: (
     logsToSave: LogPresensi[]
@@ -64,6 +65,7 @@ const STATUS_OPTIONS: StatusPresensi[] = [
 export const InputMassal: React.FC<InputMassalProps> = ({
   masterList,
   existingLogs,
+  cutiList = [],
   threshold,
   onBatchSave,
   onRefreshData,
@@ -75,6 +77,7 @@ export const InputMassal: React.FC<InputMassalProps> = ({
   const [selectedJabatan, setSelectedJabatan] = useState<string>('Semua');
   const [showAllUnscheduled, setShowAllUnscheduled] = useState<boolean>(false);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
+  const [confirmResetOpen, setConfirmResetOpen] = useState<boolean>(false);
 
   const [rowStateMap, setRowStateMap] = useState<Map<string, RowState>>(new Map());
   const [isSaving, setIsSaving] = useState<boolean>(false);
@@ -84,6 +87,12 @@ export const InputMassal: React.FC<InputMassalProps> = ({
     inserted?: number;
     updated?: number;
   } | null>(null);
+
+  // Effective roster for selectedDate (includes external & internal substitute assignments)
+  const effectiveRoster = useMemo(
+    () => buildEffectiveAttendanceRoster(masterList, cutiList, selectedDate, jadwalList),
+    [masterList, cutiList, selectedDate, jadwalList]
+  );
 
   // Derive day of week from selected date
   const selectedHari = useMemo<HariSekolah>(() => {
@@ -111,7 +120,7 @@ export const InputMassal: React.FC<InputMassalProps> = ({
       logByNamaMap.set(log.nama.trim().toLowerCase(), log);
     }
 
-    for (const guru of masterList) {
+    for (const guru of effectiveRoster) {
       const key = guru.nama.trim().toLowerCase();
       const existing = logByNamaMap.get(key);
 
@@ -161,28 +170,31 @@ export const InputMassal: React.FC<InputMassalProps> = ({
 
     setRowStateMap(newMap);
     setSaveFeedback(null);
-  }, [selectedDate, existingLogs, masterList, threshold]);
+    setConfirmResetOpen(false);
+  }, [selectedDate, existingLogs, effectiveRoster, threshold, jadwalList, settings]);
 
   // Unique Jabatan list for filter dropdown
   const jabatanOptions = useMemo(() => {
     const set = new Set<string>();
-    masterList.forEach((m) => {
+    effectiveRoster.forEach((m) => {
       if (m.jabatan) set.add(m.jabatan);
     });
     return Array.from(set).sort();
-  }, [masterList]);
+  }, [effectiveRoster]);
 
   const teacherByName = useMemo(() => {
     const map = new Map<string, MasterGuruStaf>();
-    masterList.forEach((m) => map.set(m.nama, m));
+    effectiveRoster.forEach((m) => map.set(m.nama, m));
     return map;
-  }, [masterList]);
+  }, [effectiveRoster]);
 
-  // Filtered master list based on search, jabatan, and daily schedule
+  // Filtered roster based on search, jabatan, and daily schedule (always keeping active substitutes visible)
   const filteredList = useMemo(() => {
     const teachersOnDay = showAllUnscheduled
-      ? masterList
-      : masterList.filter((m) =>
+      ? effectiveRoster
+      : effectiveRoster.filter((m) =>
+          Boolean(m.isTempSubstitute) ||
+          Boolean(m.substitutingFor && m.substitutingFor.length > 0) ||
           isTeacherWajibHadir(m, selectedHari, jadwalList, settings?.guruTanpaJadwalWajibHadir, settings?.attendanceRuleOverrides)
         );
     return teachersOnDay.filter((m) => {
@@ -192,7 +204,7 @@ export const InputMassal: React.FC<InputMassalProps> = ({
       const matchJabatan = selectedJabatan === 'Semua' || m.jabatan === selectedJabatan;
       return matchSearch && matchJabatan;
     });
-  }, [masterList, selectedHari, showAllUnscheduled, searchQuery, selectedJabatan, jadwalList, settings]);
+  }, [effectiveRoster, selectedHari, showAllUnscheduled, searchQuery, selectedJabatan, jadwalList, settings]);
 
   // Handle Jam Datang inline change
   const handleJamDatangChange = (nama: string, newTime: string) => {
@@ -284,20 +296,19 @@ export const InputMassal: React.FC<InputMassalProps> = ({
     });
   };
 
-  // Reset form for current date
-  const handleResetCurrentDate = () => {
-    if (window.confirm('Kosongkan semua isian di tabel untuk tanggal ini?')) {
-      const resetMap = new Map<string, RowState>();
-      masterList.forEach((m) => {
-        resetMap.set(m.nama, {
-          jamDatang: '',
-          status: '',
-          keterangan: '',
-          isModified: true
-        });
+  // Reset form for current date (with inline confirm state instead of window.confirm)
+  const executeResetCurrentDate = () => {
+    const resetMap = new Map<string, RowState>();
+    effectiveRoster.forEach((m) => {
+      resetMap.set(m.nama, {
+        jamDatang: '',
+        status: '',
+        keterangan: '',
+        isModified: true
       });
-      setRowStateMap(resetMap);
-    }
+    });
+    setRowStateMap(resetMap);
+    setConfirmResetOpen(false);
   };
 
   // Count filled / modified entries
@@ -314,7 +325,10 @@ export const InputMassal: React.FC<InputMassalProps> = ({
   // Submit Batch Upsert - ONLY modified / newly edited rows!
   const handleSaveAll = async () => {
     if (isHoliday) {
-      alert('Presensi tidak dapat disimpan untuk Hari Jumat (Sekolah Libur).');
+      setSaveFeedback({
+        type: 'error',
+        message: 'Presensi tidak dapat disimpan untuk Hari Jumat (Sekolah Libur).'
+      });
       return;
     }
 
@@ -334,7 +348,7 @@ export const InputMassal: React.FC<InputMassalProps> = ({
       latestLogByNamaMap.set(log.nama.trim().toLowerCase(), log);
     }
 
-    masterList.forEach((guru) => {
+    effectiveRoster.forEach((guru) => {
       const state = rowStateMap.get(guru.nama);
       if (!state) return;
 
@@ -380,6 +394,13 @@ export const InputMassal: React.FC<InputMassalProps> = ({
         finalStatus = evaluateStatus24h(finalJam, threshold);
       }
 
+      // Append substitute context note automatically when saving substitute attendance (unless status is Cuti)
+      let finalKeterangan = state.keterangan.trim();
+      const subNote = formatSubstituteAttendanceNote(guru);
+      if (subNote && finalStatus !== 'Cuti' && !finalKeterangan.toLowerCase().includes('pengganti sementara:')) {
+        finalKeterangan = finalKeterangan ? `${finalKeterangan} ${subNote}` : subNote;
+      }
+
       // Match against fresh existingLogId if present
       const freshExisting = latestLogByNamaMap.get(guru.nama.trim().toLowerCase());
       const targetId = freshExisting?.id || state.existingLogId || `ID-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
@@ -394,7 +415,7 @@ export const InputMassal: React.FC<InputMassalProps> = ({
         mapelHariIni: mapel,
         jamDatang: finalJam,
         status: finalStatus,
-        keterangan: state.keterangan.trim(),
+        keterangan: finalKeterangan,
         peran: peranVal,
         batasStaf: batasStafVal,
         statusStaf: statusStafVal,
@@ -533,7 +554,7 @@ export const InputMassal: React.FC<InputMassalProps> = ({
                 onChange={(e) => setSelectedJabatan(e.target.value)}
                 className="w-full sm:w-48 px-3 py-2 bg-slate-50 border border-slate-300 rounded-lg text-xs font-medium text-slate-700 focus:outline-none focus:ring-2 focus:ring-[#2F5597]"
               >
-                <option value="Semua">Semua Jabatan ({masterList.length})</option>
+                <option value="Semua">Semua Jabatan ({effectiveRoster.length})</option>
                 {jabatanOptions.map((j) => (
                   <option key={j} value={j}>
                     {j}
@@ -544,25 +565,45 @@ export const InputMassal: React.FC<InputMassalProps> = ({
           </div>
 
           {/* Quick Helper Actions */}
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-2 shrink-0 flex-wrap">
             <button
               onClick={handleQuickFillOnTime}
               disabled={isHoliday}
-              className="px-3 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors"
+              className="px-3 py-2 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
               title="Isi jam 07:00 & Tepat Waktu untuk yang belum terisi di tampilan"
             >
               <Zap className="w-3.5 h-3.5 text-emerald-600" />
               <span>Isi Otomatis (07:00 Tepat Waktu)</span>
             </button>
 
-            <button
-              onClick={handleResetCurrentDate}
-              disabled={isHoliday}
-              className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 border border-slate-200 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              <span>Kosongkan</span>
-            </button>
+            {confirmResetOpen ? (
+              <div className="flex items-center gap-1.5 bg-rose-50 border border-rose-200 px-2.5 py-1.5 rounded-lg text-xs">
+                <span className="font-semibold text-rose-800">Kosongkan tabel?</span>
+                <button
+                  type="button"
+                  onClick={executeResetCurrentDate}
+                  className="px-2 py-0.5 bg-rose-600 text-white font-bold rounded hover:bg-rose-700 cursor-pointer"
+                >
+                  Ya
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmResetOpen(false)}
+                  className="px-2 py-0.5 bg-white border border-slate-300 text-slate-700 font-semibold rounded hover:bg-slate-100 cursor-pointer"
+                >
+                  Batal
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmResetOpen(true)}
+                disabled={isHoliday}
+                className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 border border-slate-200 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Kosongkan</span>
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -673,13 +714,23 @@ export const InputMassal: React.FC<InputMassalProps> = ({
 
                   const scheduleEval = evaluateTeacherScheduleForDay(m, selectedHari, threshold, jadwalList, settings?.attendanceRuleOverrides);
                   const mapelHariIni = scheduleEval.hasTeachingSchedule ? scheduleEval.mapelHariIni : getMapelHariIni(m, selectedHari, jadwalList);
+                  const substitutedSchedules = m.substitutingFor && m.substitutingFor.length > 0
+                    ? getSubstitutedSchedulesForDay({
+                        teacher: m,
+                        masterList: effectiveRoster,
+                        hari: selectedHari,
+                        threshold,
+                        jadwalList,
+                        attendanceRuleOverrides: settings?.attendanceRuleOverrides
+                      })
+                    : [];
                   const isRegistered = !!state.existingLogId;
 
                   return (
                     <tr
                       key={`massal-${m.no || index}-${m.nama}-${index}`}
                       className={`hover:bg-slate-50/80 transition-colors ${
-                        isRegistered ? 'bg-blue-50/20' : ''
+                        m.isTempSubstitute ? 'bg-purple-50/40' : isRegistered ? 'bg-blue-50/20' : ''
                       }`}
                     >
                       {/* No */}
@@ -689,21 +740,52 @@ export const InputMassal: React.FC<InputMassalProps> = ({
 
                       {/* Nama */}
                       <td className="py-3 px-4 font-bold text-slate-800">
-                        <div className="flex items-center gap-2">
-                          <span>{m.nama}</span>
+                        <div className="space-y-1">
+                          <div>{m.nama}</div>
+                          {m.substitutingFor && m.substitutingFor.length > 0 && (
+                            <div className="inline-flex flex-wrap items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-purple-100 text-purple-900 border border-purple-200">
+                              <span>
+                                {m.isTempSubstitute ? 'Pengganti Sementara:' : '+ Menggantikan:'}{' '}
+                                {m.substitutingFor.map((s) => `${s.guruCutiNama}${s.classNote ? ` (${s.classNote})` : ''}`).join(', ')}
+                              </span>
+                            </div>
+                          )}
                         </div>
                       </td>
 
                       {/* Jabatan */}
                       <td className="py-3 px-4">
-                        <span className="inline-block px-2.5 py-1 rounded-md text-[11px] font-medium bg-slate-100 text-slate-700 border border-slate-200">
+                        <span className={`inline-block px-2.5 py-1 rounded-md text-[11px] font-medium border ${
+                          m.isTempSubstitute
+                            ? 'bg-purple-50 text-purple-900 border-purple-200'
+                            : 'bg-slate-100 text-slate-700 border-slate-200'
+                        }`}>
                           {m.jabatan || '-'}
                         </span>
                       </td>
 
                       {/* Mapel Hari Ini */}
-                      <td className="py-3 px-4 text-slate-600 font-medium">
-                        {scheduleEval.sesiList.length > 0 ? (
+                      <td className="py-3 px-4 text-slate-600 font-medium space-y-1.5">
+                        {m.isTempSubstitute && substitutedSchedules.length > 0 ? (
+                          <div className="flex flex-wrap gap-1">
+                            {substitutedSchedules.flatMap((g) => g.matchedSesiList).length > 0 ? (
+                              substitutedSchedules.flatMap((g, gIdx) =>
+                                g.matchedSesiList.map((s, sIdx) => (
+                                  <span
+                                    key={`${gIdx}-${sIdx}`}
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-semibold bg-purple-50 text-purple-900 border border-purple-200"
+                                  >
+                                    <span className="font-mono text-[10px] text-purple-700 font-bold">{s.labelJam}:</span>
+                                    <span>{s.namaMapel}</span>
+                                    <span className="font-bold text-purple-950">({s.kelas})</span>
+                                  </span>
+                                ))
+                              )
+                            ) : (
+                              <span className="text-slate-500 text-xs">{mapelHariIni}</span>
+                            )}
+                          </div>
+                        ) : scheduleEval.sesiList.length > 0 ? (
                           <div className="flex flex-wrap gap-1">
                             {scheduleEval.sesiList.map((s, sIdx) => (
                               <span
@@ -718,6 +800,25 @@ export const InputMassal: React.FC<InputMassalProps> = ({
                           </div>
                         ) : (
                           <span className="text-slate-500 text-xs">{mapelHariIni}</span>
+                        )}
+
+                        {!m.isTempSubstitute && substitutedSchedules.some((g) => g.matchedSesiList.length > 0) && (
+                          <div className="flex flex-wrap gap-1">
+                            {substitutedSchedules.flatMap((g, gIdx) =>
+                              g.matchedSesiList.map((s, sIdx) => (
+                                <span
+                                  key={`sub-${gIdx}-${sIdx}`}
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10.5px] font-semibold bg-purple-50 text-purple-900 border border-purple-200"
+                                  title={`Jadwal pengganti untuk ${g.assignment.guruCutiNama}`}
+                                >
+                                  <span className="font-black text-purple-700">Pengganti:</span>
+                                  <span className="font-mono text-[10px] font-bold">{s.labelJam}</span>
+                                  <span>{s.namaMapel}</span>
+                                  <span className="font-bold">({s.kelas})</span>
+                                </span>
+                              ))
+                            )}
+                          </div>
                         )}
                       </td>
 

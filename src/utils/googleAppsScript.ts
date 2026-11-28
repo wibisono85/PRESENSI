@@ -1,4 +1,4 @@
-import { AppSettings, AttendanceRuleMode, DataCutiRecord, JadwalSlot, LogPresensi, MasterGuruStaf, StatusPresensi, TestApiResponse } from '../types';
+import { AppSettings, AttendanceRuleMode, DataCutiRecord, DataSpRecord, JadwalSlot, LogPresensi, MasterGuruStaf, SpJenisDokumen, SpPenerbit, SpStatusTindakLanjut, SpTahap, StatusPresensi, TestApiResponse } from '../types';
 import { DEFAULT_MASTER_GURU_STAF } from '../data/defaultMaster';
 import { parseAndFormat24hTime } from './timeUtils';
 import { DEFAULT_SCHOOL_COORDS, normalizeCoordinate } from './qrAndGeoUtils';
@@ -35,6 +35,8 @@ function doGet(e) {
     return createJsonResponse({ status: 'success', logs: allLogs });
   } else if (action === 'cuti') {
     return createJsonResponse({ status: 'success', cuti: getCutiData(ss) });
+  } else if (action === 'sp') {
+    return createJsonResponse({ status: 'success', sp: getSpData(ss) });
   } else if (action === 'getJadwal') {
     var jResult = getJadwalData(ss);
     return createJsonResponse({
@@ -44,6 +46,13 @@ function doGet(e) {
       jadwalAktif: jResult.jadwalAktif,
       terms: jResult.terms
     });
+  } else if (action === 'previewWaReminder') {
+    var remPreview = buildWaReminder0830Data(ss, '');
+    return createJsonResponse({
+      status: 'success',
+      waGatewayStatus: getWaGatewayStatus(ss),
+      reminder: remPreview
+    });
   } else {
     var jAll = getJadwalData(ss);
     return createJsonResponse({
@@ -51,7 +60,9 @@ function doGet(e) {
       master: getMasterData(ss),
       logs: getLogData(ss),
       cuti: getCutiData(ss),
+      sp: getSpData(ss),
       settings: getSettingsData(ss),
+      waGatewayStatus: getWaGatewayStatus(ss),
       jadwal: jAll.rows,
       jadwalAktif: jAll.jadwalAktif,
       terms: jAll.terms
@@ -221,6 +232,106 @@ function doPost(e) {
         });
       } finally {
         batchLock.releaseLock();
+      }
+
+    } else if (action === 'batchAutoAlpa') {
+      var autoLogs = payload.logs || payload.data || [];
+      if (!Array.isArray(autoLogs) || autoLogs.length === 0) {
+        return createJsonResponse({ status: 'success', inserted: 0, skipped: 0, message: 'Tidak ada kandidat auto-alpa.' });
+      }
+      var autoLock = LockService.getScriptLock();
+      try {
+        autoLock.waitLock(30000);
+      } catch (lockErr) {
+        return createJsonResponse({ status: 'error', message: 'Server sedang sibuk. Coba beberapa saat lagi.' });
+      }
+      try {
+        var autoLogSheet = findSheetFlexible(ss, ['Log_Presensi', 'Log Presensi', 'Data_Presensi', 'Presensi', 'Log'], ['log_presensi', 'log presensi', 'data_presensi', 'presensi']);
+        if (!autoLogSheet) {
+          autoLogSheet = ss.insertSheet('Log_Presensi');
+        }
+        ensureLogHeaders(autoLogSheet);
+
+        var existAutoRows = autoLogSheet.getDataRange().getValues();
+        var existKeyMap = {};
+        var lastAutoContentRow = 1;
+        for (var ai = 1; ai < existAutoRows.length; ai++) {
+          var rowAny = false;
+          for (var ac = 0; ac < existAutoRows[ai].length; ac++) {
+            if (existAutoRows[ai][ac] !== '' && existAutoRows[ai][ac] !== null && existAutoRows[ai][ac] !== undefined) {
+              rowAny = true;
+              break;
+            }
+          }
+          if (rowAny) lastAutoContentRow = ai + 1;
+          var aNama = String(existAutoRows[ai][4] || '').trim().toLowerCase();
+          var aTgl = formatDate(existAutoRows[ai][2]).trim();
+          if (aNama && aTgl) {
+            existKeyMap[aNama + '_' + aTgl] = true;
+          }
+        }
+
+        // Lindungi guru yang memiliki data Cuti aktif
+        var activeCutiList = getCutiData(ss).filter(function(c) {
+          return !c.statusPengajuan || c.statusPengajuan === 'Aktif';
+        });
+
+        var toAppendAuto = [];
+        var skippedAuto = 0;
+        for (var al = 0; al < autoLogs.length; al++) {
+          var alItem = autoLogs[al];
+          if (!alItem || !alItem.nama || !alItem.tanggal) continue;
+          var alNamaNorm = String(alItem.nama).trim().toLowerCase();
+          var alTglStr = String(alItem.tanggal).trim();
+          var alKey = alNamaNorm + '_' + alTglStr;
+          if (existKeyMap[alKey]) {
+            skippedAuto++;
+            continue;
+          }
+          var hasCutiOnDate = activeCutiList.some(function(c) {
+            return String(c.nama || '').trim().toLowerCase() === alNamaNorm &&
+              c.tanggalMulai && alTglStr >= c.tanggalMulai && alTglStr <= (c.tanggalSelesai || c.tanggalMulai);
+          });
+          if (hasCutiOnDate) {
+            skippedAuto++;
+            continue;
+          }
+
+          existKeyMap[alKey] = true;
+          var alBStaf = alItem.batasStaf ? ("'" + String(alItem.batasStaf).replace(/^'/, '')) : '';
+          var alBMengajar = alItem.batasMengajar ? ("'" + String(alItem.batasMengajar).replace(/^'/, '')) : '';
+          toAppendAuto.push([
+            alItem.id || ('AUTO-ALPA-' + alTglStr + '-' + al),
+            alItem.timestamp || new Date().toISOString(),
+            alTglStr,
+            alItem.hari || '',
+            String(alItem.nama).trim(),
+            alItem.jabatan || '-',
+            alItem.mapelHariIni || '-',
+            alItem.jamDatang || '-',
+            alItem.status || 'Alpa',
+            alItem.keterangan || '[Otomatis Sistem: Tidak Hadir]',
+            alItem.peran || '',
+            alBStaf,
+            alItem.statusStaf || 'Alpa',
+            alBMengajar,
+            alItem.statusMengajar || '-'
+          ]);
+        }
+
+        if (toAppendAuto.length > 0) {
+          var startAutoRow = Math.max(lastAutoContentRow, 1) + 1;
+          autoLogSheet.getRange(startAutoRow, 1, toAppendAuto.length, 15).setValues(toAppendAuto);
+        }
+
+        return createJsonResponse({
+          status: 'success',
+          inserted: toAppendAuto.length,
+          skipped: skippedAuto,
+          message: 'Auto-Alpa selesai: ' + toAppendAuto.length + ' Tidak Hadir dicatat, ' + skippedAuto + ' sudah ada/cuti.'
+        });
+      } finally {
+        autoLock.releaseLock();
       }
 
     } else if (action === 'deleteLog') {
@@ -792,6 +903,190 @@ function doPost(e) {
       } finally {
         bCutiLock.releaseLock();
       }
+    } else if (action === 'revokeCuti') {
+      var revId = String(payload.id || '').trim();
+      var revNama = String(payload.nama || '').trim().toLowerCase();
+      var revEffectiveDate = String(payload.effectiveDate || '').trim();
+      var revOldEnd = String(payload.oldTanggalSelesai || '').trim();
+      var revNewEnd = String(payload.newTanggalSelesai || '').trim();
+      var revNewDays = payload.newJumlahHariEfektif !== undefined ? Number(payload.newJumlahHariEfektif) : null;
+      var revStatus = String(payload.statusPengajuan || 'Dicabut').trim();
+      var revCatatan = payload.catatan !== undefined ? String(payload.catatan) : null;
+
+      if (!revNama || !revEffectiveDate) {
+        return createJsonResponse({ status: 'error', message: 'Field nama dan effectiveDate wajib diisi untuk mencabut cuti.' });
+      }
+
+      var revLock = LockService.getScriptLock();
+      try {
+        revLock.waitLock(30000);
+      } catch (lockErr) {
+        return createJsonResponse({ status: 'error', message: 'Server sedang sibuk. Coba beberapa saat lagi.' });
+      }
+
+      try {
+        var cutiSheetRev = ensureCutiSheet(ss);
+        var revRows = cutiSheetRev.getDataRange().getValues();
+        var updatedCutiRows = 0;
+        for (var ri = 1; ri < revRows.length; ri++) {
+          var rowId = String(revRows[ri][0] || '').trim();
+          var rowNama = String(revRows[ri][2] || '').trim().toLowerCase();
+          var rowMulai = formatDate(revRows[ri][6]).trim();
+          var rowSelesai = formatDate(revRows[ri][7]).trim();
+          var matchesId = revId && rowId === revId;
+          var matchesSig = !revId && rowNama === revNama && (!revOldEnd || rowSelesai === revOldEnd || (revEffectiveDate >= rowMulai && revEffectiveDate <= rowSelesai));
+          if (matchesId || matchesSig) {
+            if (revNewEnd) {
+              cutiSheetRev.getRange(ri + 1, 8).setValue("'" + revNewEnd);
+            }
+            if (revNewDays !== null && !isNaN(revNewDays)) {
+              cutiSheetRev.getRange(ri + 1, 9).setValue(revNewDays);
+            }
+            if (revCatatan !== null) {
+              cutiSheetRev.getRange(ri + 1, 13).setValue(revCatatan || '-');
+            }
+            cutiSheetRev.getRange(ri + 1, 14).setValue(revStatus);
+            updatedCutiRows++;
+            break;
+          }
+        }
+
+        var logSheetRev = findSheetFlexible(ss, ['Log_Presensi', 'Log Presensi', 'Data_Presensi', 'Presensi', 'Log'], ['log_presensi', 'log presensi', 'data_presensi', 'presensi']);
+        var deletedRevLogs = 0;
+        if (logSheetRev) {
+          var lRevRows = logSheetRev.getDataRange().getValues();
+          for (var lri = lRevRows.length - 1; lri >= 1; lri--) {
+            var lRevNama = String(lRevRows[lri][4] || '').trim().toLowerCase();
+            var lRevTgl = formatDate(lRevRows[lri][2]).trim();
+            var lRevSt = String(lRevRows[lri][8] || '').trim().toLowerCase();
+            if (
+              lRevNama === revNama &&
+              lRevSt === 'cuti' &&
+              lRevTgl >= revEffectiveDate &&
+              (!revOldEnd || lRevTgl <= revOldEnd)
+            ) {
+              logSheetRev.deleteRow(lri + 1);
+              deletedRevLogs++;
+            }
+          }
+        }
+
+        return createJsonResponse({
+          status: 'success',
+          message: 'Cuti berhasil dicabut/diaktifkan kembali (' + updatedCutiRows + ' catatan Data_Cuti diperbarui, ' + deletedRevLogs + ' baris Cuti mulai ' + revEffectiveDate + ' dihapus dari Log_Presensi).',
+          updatedCutiRows: updatedCutiRows,
+          deletedLogRows: deletedRevLogs
+        });
+      } finally {
+        revLock.releaseLock();
+      }
+    } else if (action === 'saveSp') {
+      var sData = payload.data || payload;
+      if (!sData || !sData.nama || !sData.nomorSurat) {
+        return createJsonResponse({ status: 'error', message: 'Field Nama dan Nomor Surat wajib diisi.' });
+      }
+      var spLock = LockService.getScriptLock();
+      try {
+        spLock.waitLock(30000);
+      } catch (lockErr) {
+        return createJsonResponse({ status: 'error', message: 'Server sedang sibuk. Coba beberapa saat lagi.' });
+      }
+      try {
+        var spSheet = ensureSpSheet(ss);
+        var spId = String(sData.id || ('SP-REC-' + Date.now())).trim();
+        var spRows = spSheet.getDataRange().getValues();
+        if (spSheet.getLastColumn() < 28 && spSheet.getLastRow() >= 1) {
+          spSheet.getRange(1, 28).setValue('Rincian Pelanggaran');
+        }
+        var spRowVals = [
+          spId,
+          String(sData.waktuDibuat || Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone() || 'Asia/Jakarta', 'yyyy-MM-dd HH:mm:ss')),
+          "'" + String(sData.nomorSurat).trim(),
+          "'" + String(sData.tanggalSurat || '').trim(),
+          String(sData.tahap || 'Teguran / Pembinaan I').trim(),
+          String(sData.jenisDokumen || 'berita_acara_pembinaan').trim(),
+          String(sData.penerbit || 'Waka Kurikulum').trim(),
+          Number(sData.urutanKe) || 1,
+          String(sData.nama).trim(),
+          "'" + String(sData.nipNty || '-').trim(),
+          String(sData.jabatan || '-').trim(),
+          String(sData.mataPelajaran || '-').trim(),
+          String(sData.lokasiPertemuan || 'Ruang Kurikulum SMP Nurul Abror Al-Robbaniyin').trim(),
+          String(sData.alasanUtama || '-').trim(),
+          sData.tanggalRapatAbsen ? ("'" + String(sData.tanggalRapatAbsen).trim()) : '',
+          String(sData.periodeBulan || '-').trim(),
+          String(sData.persentaseKehadiran || '-').trim(),
+          String(sData.pelanggaranLainnya || '-').trim(),
+          String(sData.catatanKlarifikasi || '-').trim(),
+          sData.disertaiPemanggilan === true || String(sData.disertaiPemanggilan) === 'true' ? 'YA' : 'TIDAK',
+          sData.tanggalPemanggilan ? ("'" + String(sData.tanggalPemanggilan).trim()) : '',
+          sData.jamPemanggilan ? ("'" + String(sData.jamPemanggilan).trim()) : '',
+          String(sData.tempatPemanggilan || '-').trim(),
+          String(sData.riwayatTerkait || '-').trim(),
+          String(sData.namaPenandatangan || '-').trim(),
+          "'" + String(sData.nipPenandatangan || '-').trim(),
+          String(sData.statusTindakLanjut || 'Diterbitkan').trim(),
+          String(sData.rincianPelanggaran || '-').trim()
+        ];
+
+        var targetSpRow = -1;
+        for (var si = 1; si < spRows.length; si++) {
+          if (String(spRows[si][0] || '').trim() === spId) {
+            targetSpRow = si + 1;
+            break;
+          }
+        }
+        if (targetSpRow > -1) {
+          spSheet.getRange(targetSpRow, 1, 1, 28).setValues([spRowVals]);
+        } else {
+          spSheet.appendRow(spRowVals);
+        }
+        return createJsonResponse({
+          status: 'success',
+          message: 'Catatan & Nomor Surat SP/Pembinaan tersimpan ke sheet Data_SP.',
+          id: spId
+        });
+      } finally {
+        spLock.releaseLock();
+      }
+    } else if (action === 'deleteSp') {
+      var delSpId = String(payload.id || '').trim();
+      if (!delSpId) {
+        return createJsonResponse({ status: 'error', message: 'ID surat wajib diisi.' });
+      }
+      var delSpLock = LockService.getScriptLock();
+      try {
+        delSpLock.waitLock(30000);
+      } catch (lockErr) {
+        return createJsonResponse({ status: 'error', message: 'Server sedang sibuk. Coba beberapa saat lagi.' });
+      }
+      try {
+        var spSheetDel = findSheetFlexible(ss, ['Data_SP', 'Data SP'], ['data_sp', 'surat_peringatan']);
+        var deletedSpRows = 0;
+        if (spSheetDel) {
+          var sRows = spSheetDel.getDataRange().getValues();
+          for (var sr = sRows.length - 1; sr >= 1; sr--) {
+            if (String(sRows[sr][0] || '').trim() === delSpId) {
+              spSheetDel.deleteRow(sr + 1);
+              deletedSpRows++;
+            }
+          }
+        }
+        return createJsonResponse({
+          status: 'success',
+          message: 'Catatan SP/Pembinaan berhasil dihapus (' + deletedSpRows + ' baris).',
+          deletedSpRows: deletedSpRows
+        });
+      } finally {
+        delSpLock.releaseLock();
+      }
+    } else if (action === 'sendWaReminder') {
+      var remRes = kirimPengingatWaBelumAbsenSekarang(
+        payload.forceSend === true,
+        payload.customMessage ? String(payload.customMessage) : '',
+        payload.appPublicUrl ? String(payload.appPublicUrl) : ''
+      );
+      return createJsonResponse(remRes);
     }
     
     return createJsonResponse({ status: 'error', message: 'Aksi tidak dikenali.' });
@@ -802,7 +1097,7 @@ function doPost(e) {
 
 /**
  * Jalankan fungsi ini secara manual di editor Apps Script (tombol Run/Jalankan)
- * untuk membuat seluruh sheet (termasuk Data_Cuti) dan memigrasikan data cuti dari Log_Presensi.
+ * untuk membuat seluruh sheet (termasuk Data_Cuti & Data_SP) dan memigrasikan data cuti dari Log_Presensi.
  */
 function setupDanCekDatabase() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -811,16 +1106,667 @@ function setupDanCekDatabase() {
   }
   ensureSheets(ss);
   var cutiList = getCutiData(ss);
+  var spList = getSpData(ss);
   var logList = getLogData(ss);
   Logger.log('=== CEK DATABASE PRESENSI ===');
   Logger.log('Spreadsheet: ' + ss.getName());
   Logger.log('Jumlah Log_Presensi: ' + logList.length);
   Logger.log('Jumlah Data_Cuti: ' + cutiList.length);
+  Logger.log('Jumlah Data_SP: ' + spList.length);
   return {
     spreadsheet: ss.getName(),
     logsCount: logList.length,
-    cutiCount: cutiList.length
+    cutiCount: cutiList.length,
+    spCount: spList.length
   };
+}
+
+/**
+ * Jalankan fungsi ini SEKALI di editor Apps Script untuk mengaktifkan
+ * Trigger Otomatis setiap 15 menit yang mencatat "Tidak Hadir / Alpa"
+ * setelah melewati 90 menit dari jam masuk / jadwal wajib hadir (meski browser tidak dibuka).
+ */
+function pasangTriggerAutoAlpaOtomatis() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'prosesAutoAlpaHarian') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  ScriptApp.newTrigger('prosesAutoAlpaHarian')
+    .timeBased()
+    .everyMinutes(15)
+    .create();
+  Logger.log('Trigger otomatis prosesAutoAlpaHarian (setiap 15 menit) berhasil diaktifkan.');
+}
+
+function parseTimeMinutesGs(str) {
+  if (!str) return null;
+  var m = String(str).match(/(\\d{1,2})[:.](\\d{2})/);
+  if (!m) return null;
+  var h = parseInt(m[1], 10);
+  var min = parseInt(m[2], 10);
+  if (isNaN(h) || isNaN(min) || h < 0 || h > 23 || min < 0 || min > 59) return null;
+  return h * 60 + min;
+}
+
+function formatMinutesGs(mins) {
+  var h = Math.floor(mins / 60);
+  var m = mins % 60;
+  return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+}
+
+/**
+ * Mengisi otomatis status "Alpa / Tidak Hadir" bagi Guru & Staf wajib hadir
+ * yang belum melakukan presensi melebihi grace period (default +90 menit).
+ */
+function prosesAutoAlpaHarian() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) return 0;
+  ensureSheets(ss);
+
+  var cfg = getSettingsData(ss) || {};
+  if (String(cfg.autoAlpaEnabled || 'true').toLowerCase() === 'false') {
+    return 0;
+  }
+
+  var tz = ss.getSpreadsheetTimeZone() || 'Asia/Jakarta';
+  var now = new Date();
+  var todayISO = Utilities.formatDate(now, tz, 'yyyy-MM-dd');
+  var dayNames = ['Ahad', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+  var hariIni = dayNames[now.getDay()];
+  if (hariIni === 'Jumat') return 0;
+
+  var startDate = String(cfg.autoAlpaMulaiTanggal || todayISO).trim();
+  if (startDate && todayISO < startDate) return 0;
+
+  var graceMenit = parseInt(String(cfg.autoAlpaGraceMenit || '90'), 10);
+  if (isNaN(graceMenit) || graceMenit < 15) graceMenit = 90;
+  var threshold = String(cfg.jamMasukThreshold || '07:25').trim() || '07:25';
+  var toleransiGuru = parseInt(String(cfg.guruToleransiMenit || '0'), 10) || 0;
+  var guruTanpaJadwalWajib = String(cfg.guruTanpaJadwalWajibHadir || 'false').toLowerCase() === 'true';
+  var cutoffMode = String(cfg.autoAlpaCutoffMode || 'setelah_jam_masuk').trim();
+  var batasAkhirJam = String(cfg.autoAlpaBatasAkhirJam || '09:00').trim();
+
+  var overrides = {};
+  if (cfg.attendanceRuleOverrides) {
+    try { overrides = JSON.parse(cfg.attendanceRuleOverrides); } catch (e) {}
+  }
+
+  var nowMins = now.getHours() * 60 + now.getMinutes();
+  var masterList = getMasterData(ss);
+  var logs = getLogData(ss);
+  var cutiList = getCutiData(ss).filter(function(c) { return !c.statusPengajuan || c.statusPengajuan === 'Aktif'; });
+  var jRes = getJadwalData(ss);
+  var jadwalRows = jRes.rows || [];
+  var activeTahun = jRes.jadwalAktif ? jRes.jadwalAktif.tahunAjaran : '';
+  var activeSem = jRes.jadwalAktif ? jRes.jadwalAktif.semester : '';
+
+  var existMap = {};
+  for (var li = 0; li < logs.length; li++) {
+    if (logs[li].tanggal === todayISO && logs[li].nama) {
+      existMap[String(logs[li].nama).trim().toLowerCase()] = true;
+    }
+  }
+
+  var toAppend = [];
+  for (var mi = 0; mi < masterList.length; mi++) {
+    var m = masterList[mi];
+    var nama = String(m.nama || '').trim();
+    if (!nama) continue;
+    var norm = nama.toLowerCase();
+    if (existMap[norm]) continue;
+
+    var onCuti = cutiList.some(function(c) {
+      return String(c.nama || '').trim().toLowerCase() === norm &&
+        c.tanggalMulai && todayISO >= c.tanggalMulai && todayISO <= (c.tanggalSelesai || c.tanggalMulai);
+    });
+    if (onCuti) continue;
+
+    var jabLower = String(m.jabatan || '').toLowerCase();
+    var isBk = jabLower.indexOf('bk') > -1 || jabLower.indexOf('bimbingan') > -1 || jabLower.indexOf('konseling') > -1;
+    var kodeGuru = m.kodeGuru ? parseInt(String(m.kodeGuru), 10) : 0;
+
+    var todaySlots = jadwalRows.filter(function(s) {
+      if (activeTahun && s.tahunAjaran && s.tahunAjaran !== activeTahun) return false;
+      if (activeSem && s.semester && s.semester !== activeSem) return false;
+      if (String(s.hari || '').toLowerCase() !== hariIni.toLowerCase()) return false;
+      if (kodeGuru > 0 && s.kodeGuru === kodeGuru) return true;
+      return String(s.namaGuru || '').trim().toLowerCase() === norm;
+    });
+
+    var hasSlotAnyDay = jadwalRows.some(function(s) {
+      if (activeTahun && s.tahunAjaran && s.tahunAjaran !== activeTahun) return false;
+      if (activeSem && s.semester && s.semester !== activeSem) return false;
+      if (kodeGuru > 0 && s.kodeGuru === kodeGuru) return true;
+      return String(s.namaGuru || '').trim().toLowerCase() === norm;
+    });
+
+    var rawPeran = String(m.peran || '').trim();
+    var ruleMode = overrides[norm] || '';
+    if (!ruleMode) {
+      if (rawPeran === 'Guru') ruleMode = 'sesuai_jadwal';
+      else if (rawPeran === 'Staf' || rawPeran === 'Guru BK') ruleMode = 'wajib_harian';
+      else if (rawPeran === 'Guru+Staf' || rawPeran === 'Guru BK+Mengajar') ruleMode = 'ganda';
+      else if (isBk) ruleMode = hasSlotAnyDay ? 'ganda' : 'wajib_harian';
+      else if (hasSlotAnyDay) {
+        var isStruk = /kepala sekolah|waka|kurikulum|kesiswaan|sarpras|humas|tu|tata usaha|ops|operator|keuangan|bendahara/i.test(jabLower);
+        ruleMode = isStruk ? 'ganda' : 'sesuai_jadwal';
+      } else {
+        ruleMode = 'wajib_harian';
+      }
+    }
+
+    var hasTeachingToday = todaySlots.length > 0;
+    var wajibHadir = (ruleMode === 'wajib_harian' || ruleMode === 'ganda') ? true : (hasTeachingToday || guruTanpaJadwalWajib);
+    if (!wajibHadir) continue;
+
+    var firstSlotStart = null;
+    for (var si = 0; si < todaySlots.length; si++) {
+      var jm = parseTimeMinutesGs(todaySlots[si].jamMulai);
+      if (jm !== null && (firstSlotStart === null || jm < firstSlotStart)) {
+        firstSlotStart = jm;
+      }
+    }
+
+    var entryMins = parseTimeMinutesGs(threshold) || 445;
+    if (ruleMode === 'sesuai_jadwal' && firstSlotStart !== null) {
+      entryMins = Math.max(0, firstSlotStart - toleransiGuru);
+    } else if (ruleMode === 'ganda' && firstSlotStart !== null) {
+      entryMins = Math.min(entryMins, Math.max(0, firstSlotStart - toleransiGuru));
+    }
+
+    var deadlineMins = entryMins + graceMenit;
+    if (cutoffMode === 'batas_akhir_tetap' && batasAkhirJam) {
+      var fMins = parseTimeMinutesGs(batasAkhirJam);
+      if (fMins !== null) {
+        deadlineMins = ruleMode === 'sesuai_jadwal'
+          ? Math.max(fMins, entryMins + graceMenit)
+          : Math.max(fMins, entryMins + 30);
+      }
+    }
+
+    if (nowMins <= deadlineMins) continue;
+
+    var alpaStatus = ruleMode === 'sesuai_jadwal'
+      ? 'Alpa (Jadwal Mengajar)'
+      : (isBk ? 'Alpa (Wajib Hadir Guru BK)' : 'Alpa (Wajib Hadir Staf)');
+    var deadlineStr = formatMinutesGs(deadlineMins);
+    var entryStr = formatMinutesGs(entryMins);
+    var slug = norm.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 32);
+
+    toAppend.push([
+      'AUTO-ALPA-' + todayISO + '-' + slug,
+      todayISO + ' ' + deadlineStr + ':00',
+      todayISO,
+      hariIni,
+      nama,
+      m.jabatan || '-',
+      hasTeachingToday ? todaySlots.map(function(s) { return s.sesi + ': ' + s.namaMapel + ' (' + s.kelas + ')'; }).join(', ') : (isBk ? 'Tugas Bimbingan & Konseling (Guru BK)' : 'Tugas Kantor / Operasional Sekolah'),
+      '-',
+      alpaStatus,
+      '[Otomatis Sistem: Tidak Hadir] Tidak mengisi presensi hingga batas maksimal ' + deadlineStr + ' WIB (+' + graceMenit + ' menit dari jam masuk ' + entryStr + ' WIB).',
+      rawPeran || (isBk ? (hasSlotAnyDay ? 'Guru BK+Mengajar' : 'Guru BK') : (ruleMode === 'sesuai_jadwal' ? 'Guru' : (ruleMode === 'ganda' ? 'Guru+Staf' : 'Staf'))),
+      (ruleMode === 'wajib_harian' || ruleMode === 'ganda') ? ("'" + threshold) : '',
+      (ruleMode === 'wajib_harian' || ruleMode === 'ganda') ? 'Alpa' : '-',
+      hasTeachingToday ? ("'" + formatMinutesGs(Math.max(0, (firstSlotStart || 450) - toleransiGuru))) : '',
+      hasTeachingToday ? 'Alpa' : '-'
+    ]);
+  }
+
+  if (toAppend.length > 0) {
+    var logSheet = findSheetFlexible(ss, ['Log_Presensi', 'Log Presensi', 'Data_Presensi', 'Presensi', 'Log'], ['log_presensi', 'log presensi', 'data_presensi', 'presensi']);
+    ensureLogHeaders(logSheet);
+    var lastRow = Math.max(logSheet.getLastRow(), 1);
+    logSheet.getRange(lastRow + 1, 1, toAppend.length, 15).setValues(toAppend);
+  }
+  return toAppend.length;
+}
+
+/**
+ * Jalankan fungsi ini SEKALI di editor Apps Script untuk mengaktifkan
+ * Pengingat Otomatis ke Grup WhatsApp Sekolah setiap pukul 08:30 WIB
+ * (memerlukan WA_GATEWAY_TOKEN & WA_GROUP_ID di Script Properties / Pengaturan).
+ */
+function pasangTriggerPengingatWa0830() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'cekDanKirimPengingatWa0830') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  ScriptApp.newTrigger('cekDanKirimPengingatWa0830')
+    .timeBased()
+    .everyMinutes(15)
+    .create();
+  Logger.log('Trigger otomatis cekDanKirimPengingatWa0830 (setiap 15 menit, kirim 1x/hari tepat setelah pukul 08:30 WIB) berhasil diaktifkan.');
+}
+
+function getWaGatewayStatus(ss) {
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  var props = PropertiesService.getScriptProperties();
+  var cfg = (ss ? getSettingsData(ss) : null) || {};
+  var provider = String(props.getProperty('WA_GATEWAY_PROVIDER') || cfg.waGatewayProvider || 'fonnte').trim().toLowerCase();
+  var gatewayUrl = String(props.getProperty('WA_GATEWAY_URL') || cfg.waGatewayUrl || '').trim();
+  var token = String(props.getProperty('WA_GATEWAY_TOKEN') || '').trim();
+  var groupId = String(props.getProperty('WA_GROUP_ID') || cfg.waGroupId || '').trim();
+  var lastSentDate = String(props.getProperty('LAST_WA_REMINDER_DATE') || '').trim();
+  var lastStatus = String(props.getProperty('LAST_WA_REMINDER_STATUS') || '').trim();
+
+  var effectiveUrl = gatewayUrl || (provider === 'fonnte' ? 'https://api.fonnte.com/send' : '');
+  var hasAuth = provider === 'webhook' ? Boolean(effectiveUrl) : Boolean(token && effectiveUrl && groupId);
+  if (provider === 'webhook' && !groupId) {
+    // Custom webhook (n8n/Make/bot) may hardcode target group internally
+    hasAuth = Boolean(effectiveUrl);
+  }
+
+  return {
+    configured: hasAuth,
+    provider: provider,
+    hasToken: Boolean(token),
+    hasGroupId: Boolean(groupId),
+    hasGatewayUrl: Boolean(effectiveUrl),
+    lastSentDate: lastSentDate,
+    lastStatus: lastStatus
+  };
+}
+
+function buildWaReminder0830Data(ss, customAppUrl) {
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  ensureSheets(ss);
+
+  var cfg = getSettingsData(ss) || {};
+  var tz = ss.getSpreadsheetTimeZone() || 'Asia/Jakarta';
+  var now = new Date();
+  var todayISO = Utilities.formatDate(now, tz, 'yyyy-MM-dd');
+  var dayNames = ['Ahad', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+  var hariIni = dayNames[now.getDay()];
+  var reminderJam = String(cfg.waReminderJam || '08:30').trim() || '08:30';
+  var reminderMins = parseTimeMinutesGs(reminderJam);
+  if (reminderMins === null) reminderMins = 510;
+
+  if (hariIni === 'Jumat') {
+    return {
+      isHoliday: true,
+      tanggal: todayISO,
+      hari: hariIni,
+      reminderJam: reminderJam,
+      totalBelumAbsen: 0,
+      segeraAlpaList: [],
+      jadwalSiangList: [],
+      penggantiList: [],
+      messageText: 'Hari Jumat adalah hari libur sekolah. Tidak ada pengingat presensi.'
+    };
+  }
+
+  var graceMenit = parseInt(String(cfg.autoAlpaGraceMenit || '90'), 10);
+  if (isNaN(graceMenit) || graceMenit < 15) graceMenit = 90;
+  var threshold = String(cfg.jamMasukThreshold || '07:25').trim() || '07:25';
+  var toleransiGuru = parseInt(String(cfg.guruToleransiMenit || '0'), 10) || 0;
+  var guruTanpaJadwalWajib = String(cfg.guruTanpaJadwalWajibHadir || 'false').toLowerCase() === 'true';
+  var cutoffMode = String(cfg.autoAlpaCutoffMode || 'setelah_jam_masuk').trim();
+  var batasAkhirJam = String(cfg.autoAlpaBatasAkhirJam || '09:00').trim();
+  var overrides = {};
+  if (cfg.attendanceRuleOverrides) {
+    try { overrides = JSON.parse(cfg.attendanceRuleOverrides); } catch (e) {}
+  }
+
+  var masterList = getMasterData(ss);
+  var logs = getLogData(ss);
+  var cutiList = getCutiData(ss).filter(function(c) { return !c.statusPengajuan || c.statusPengajuan === 'Aktif'; });
+  var jRes = getJadwalData(ss);
+  var jadwalRows = jRes.rows || [];
+  var activeTahun = jRes.jadwalAktif ? jRes.jadwalAktif.tahunAjaran : '';
+  var activeSem = jRes.jadwalAktif ? jRes.jadwalAktif.semester : '';
+
+  var existMap = {};
+  for (var li = 0; li < logs.length; li++) {
+    if (logs[li].tanggal === todayISO && logs[li].nama) {
+      existMap[String(logs[li].nama).trim().toLowerCase()] = true;
+    }
+  }
+
+  var masterNameSet = {};
+  for (var mn = 0; mn < masterList.length; mn++) {
+    if (masterList[mn].nama) {
+      masterNameSet[String(masterList[mn].nama).trim().toLowerCase()] = true;
+    }
+  }
+
+  var segeraAlpaList = [];
+  var jadwalSiangList = [];
+  var penggantiList = [];
+
+  for (var mi = 0; mi < masterList.length; mi++) {
+    var m = masterList[mi];
+    var nama = String(m.nama || '').trim();
+    if (!nama) continue;
+    var norm = nama.toLowerCase();
+    if (existMap[norm]) continue;
+
+    var onCuti = cutiList.some(function(c) {
+      return String(c.nama || '').trim().toLowerCase() === norm &&
+        c.tanggalMulai && todayISO >= c.tanggalMulai && todayISO <= (c.tanggalSelesai || c.tanggalMulai);
+    });
+    if (onCuti) continue;
+
+    var jabLower = String(m.jabatan || '').toLowerCase();
+    var isBk = jabLower.indexOf('bk') > -1 || jabLower.indexOf('bimbingan') > -1 || jabLower.indexOf('konseling') > -1;
+    var kodeGuru = m.kodeGuru ? parseInt(String(m.kodeGuru), 10) : 0;
+
+    var todaySlots = jadwalRows.filter(function(s) {
+      if (activeTahun && s.tahunAjaran && s.tahunAjaran !== activeTahun) return false;
+      if (activeSem && s.semester && s.semester !== activeSem) return false;
+      if (String(s.hari || '').toLowerCase() !== hariIni.toLowerCase()) return false;
+      if (kodeGuru > 0 && s.kodeGuru === kodeGuru) return true;
+      return String(s.namaGuru || '').trim().toLowerCase() === norm;
+    });
+
+    var hasSlotAnyDay = jadwalRows.some(function(s) {
+      if (activeTahun && s.tahunAjaran && s.tahunAjaran !== activeTahun) return false;
+      if (activeSem && s.semester && s.semester !== activeSem) return false;
+      if (kodeGuru > 0 && s.kodeGuru === kodeGuru) return true;
+      return String(s.namaGuru || '').trim().toLowerCase() === norm;
+    });
+
+    var rawPeran = String(m.peran || '').trim();
+    var ruleMode = overrides[norm] || '';
+    if (!ruleMode) {
+      if (rawPeran === 'Guru') ruleMode = 'sesuai_jadwal';
+      else if (rawPeran === 'Staf' || rawPeran === 'Guru BK') ruleMode = 'wajib_harian';
+      else if (rawPeran === 'Guru+Staf' || rawPeran === 'Guru BK+Mengajar') ruleMode = 'ganda';
+      else if (isBk) ruleMode = hasSlotAnyDay ? 'ganda' : 'wajib_harian';
+      else if (hasSlotAnyDay) {
+        var isStruk = /kepala sekolah|waka|kurikulum|kesiswaan|sarpras|humas|tu|tata usaha|ops|operator|keuangan|bendahara/i.test(jabLower);
+        ruleMode = isStruk ? 'ganda' : 'sesuai_jadwal';
+      } else {
+        ruleMode = 'wajib_harian';
+      }
+    }
+
+    var hasTeachingToday = todaySlots.length > 0;
+    var wajibHadir = (ruleMode === 'wajib_harian' || ruleMode === 'ganda') ? true : (hasTeachingToday || guruTanpaJadwalWajib);
+    if (!wajibHadir) continue;
+
+    var firstSlotStart = null;
+    for (var si = 0; si < todaySlots.length; si++) {
+      var jm = parseTimeMinutesGs(todaySlots[si].jamMulai);
+      if (jm !== null && (firstSlotStart === null || jm < firstSlotStart)) {
+        firstSlotStart = jm;
+      }
+    }
+
+    var entryMins = parseTimeMinutesGs(threshold) || 445;
+    if (ruleMode === 'sesuai_jadwal' && firstSlotStart !== null) {
+      entryMins = Math.max(0, firstSlotStart - toleransiGuru);
+    } else if (ruleMode === 'ganda' && firstSlotStart !== null) {
+      entryMins = Math.min(entryMins, Math.max(0, firstSlotStart - toleransiGuru));
+    }
+
+    var deadlineMins = entryMins + graceMenit;
+    if (cutoffMode === 'batas_akhir_tetap' && batasAkhirJam) {
+      var fMins = parseTimeMinutesGs(batasAkhirJam);
+      if (fMins !== null) {
+        deadlineMins = ruleMode === 'sesuai_jadwal'
+          ? Math.max(fMins, entryMins + graceMenit)
+          : Math.max(fMins, entryMins + 30);
+      }
+    }
+
+    var peranLabel = rawPeran || (isBk ? (hasSlotAnyDay ? 'Guru BK+Mengajar' : 'Guru BK') : (ruleMode === 'sesuai_jadwal' ? 'Guru' : (ruleMode === 'ganda' ? 'Guru+Staf' : 'Staf')));
+    var jadwalLabel = hasTeachingToday
+      ? todaySlots.map(function(s) { return s.sesi + ': ' + s.namaMapel + ' (' + s.kelas + ')'; }).join(', ')
+      : (isBk ? 'Wajib Hadir Guru BK' : 'Wajib Hadir Harian');
+
+    var objItem = {
+      nama: nama,
+      peran: peranLabel,
+      hasTeachingToday: hasTeachingToday,
+      ringkasanJadwal: jadwalLabel,
+      jamMasukSeharusnya: formatMinutesGs(entryMins),
+      deadlineTime: formatMinutesGs(deadlineMins)
+    };
+
+    if (entryMins <= reminderMins) {
+      segeraAlpaList.push(objItem);
+    } else {
+      jadwalSiangList.push(objItem);
+    }
+  }
+
+  // Sertakan guru pengganti eksternal yang sedang aktif menggantikan guru cuti hari ini
+  for (var ci = 0; ci < cutiList.length; ci++) {
+    var c = cutiList[ci];
+    if (!c.tanggalMulai || todayISO < c.tanggalMulai || todayISO > (c.tanggalSelesai || c.tanggalMulai)) continue;
+    var rawPengganti = String(c.guruPengganti || '').trim();
+    if (!rawPengganti || rawPengganti === '-') continue;
+    var parts = rawPengganti.split(/[,;/]/);
+    for (var pi = 0; pi < parts.length; pi++) {
+      var subName = String(parts[pi] || '').trim();
+      if (!subName) continue;
+      var subNorm = subName.toLowerCase();
+      if (existMap[subNorm] || masterNameSet[subNorm]) continue;
+      penggantiList.push({
+        nama: subName,
+        ringkasanJadwal: 'Menggantikan ' + c.nama
+      });
+      existMap[subNorm] = true;
+    }
+  }
+
+  var totalBelum = segeraAlpaList.length + jadwalSiangList.length + penggantiList.length;
+  var props = PropertiesService.getScriptProperties();
+  var appUrl = String(customAppUrl || props.getProperty('APP_PUBLIC_URL') || cfg.waAppPublicUrl || '').trim();
+
+  var lines = [
+    "Assalamu'alaikum Wr. Wb.",
+    '*PENGINGAT PRESENSI GURU & STAF (PKL. ' + reminderJam + ' WIB)*',
+    'SMP Nurul Abror Al-Robbaniyin',
+    'Hari/Tgl: ' + hariIni + ', ' + todayISO,
+    ''
+  ];
+
+  if (totalBelum === 0) {
+    lines.push('Alhamdulillah, seluruh guru & staf wajib hadir hari ini sudah tercatat presensi.');
+    lines.push("Terima kasih. Wassalamu'alaikum Wr. Wb.");
+  } else {
+    if (segeraAlpaList.length > 0) {
+      lines.push('⚠️ *Belum Presensi — Segera Sebelum Batas Auto-Alpa (+' + graceMenit + ' mnt):*');
+      for (var u = 0; u < segeraAlpaList.length; u++) {
+        var ui = segeraAlpaList[u];
+        var infoTxt = ui.hasTeachingToday ? ui.ringkasanJadwal : ui.peran;
+        lines.push((u + 1) + '. *' + ui.nama + '* (' + infoTxt + ' | Tutup Auto: *' + ui.deadlineTime + ' WIB*)');
+      }
+      lines.push('');
+    }
+    if (jadwalSiangList.length > 0) {
+      lines.push('🕒 *Pengingat Jadwal Mengajar Siang Hari Ini:*');
+      for (var l = 0; l < jadwalSiangList.length; l++) {
+        var li2 = jadwalSiangList[l];
+        lines.push((l + 1) + '. *' + li2.nama + '* — ' + li2.ringkasanJadwal + ' (Masuk ' + li2.jamMasukSeharusnya + ' WIB, Tutup Auto ' + li2.deadlineTime + ' WIB)');
+      }
+      lines.push('');
+    }
+    if (penggantiList.length > 0) {
+      lines.push('🔄 *Guru Pengganti Sementara Belum Presensi:*');
+      for (var p = 0; p < penggantiList.length; p++) {
+        lines.push((p + 1) + '. *' + penggantiList[p].nama + '* (' + penggantiList[p].ringkasanJadwal + ')');
+      }
+      lines.push('');
+    }
+    lines.push('Mohon segera melakukan presensi di sekolah agar tidak tercatat *Tidak Hadir / Alpa* secara otomatis oleh sistem.');
+    lines.push('Jika berhalangan (*Izin / Sakit / Dinas Luar*), silakan ajukan langsung dari rumah melalui Presensi Mandiri (tanpa GPS) & cantumkan tugas untuk siswa.');
+    if (appUrl) {
+      lines.push('🔗 Link Presensi: ' + appUrl);
+    }
+    lines.push('');
+    lines.push("Terima kasih atas perhatiannya. Wassalamu'alaikum Wr. Wb.");
+  }
+
+  return {
+    isHoliday: false,
+    tanggal: todayISO,
+    hari: hariIni,
+    reminderJam: reminderJam,
+    reminderMins: reminderMins,
+    totalBelumAbsen: totalBelum,
+    segeraAlpaList: segeraAlpaList,
+    jadwalSiangList: jadwalSiangList,
+    penggantiList: penggantiList,
+    messageText: lines.join('\\n')
+  };
+}
+
+function sendWaViaGateway(ss, messageText, meta) {
+  var props = PropertiesService.getScriptProperties();
+  var cfg = (ss ? getSettingsData(ss) : null) || {};
+
+  var provider = String(props.getProperty('WA_GATEWAY_PROVIDER') || cfg.waGatewayProvider || 'fonnte').trim().toLowerCase();
+  var gatewayUrl = String(props.getProperty('WA_GATEWAY_URL') || cfg.waGatewayUrl || '').trim();
+  var token = String(props.getProperty('WA_GATEWAY_TOKEN') || '').trim();
+  var groupId = String(props.getProperty('WA_GROUP_ID') || cfg.waGroupId || '').trim();
+  var groupLink = String(cfg.whatsappGroupUrl || 'https://chat.whatsapp.com/B8rLv6MTwFeHVf8Ejm70jC').trim();
+
+  if (!gatewayUrl && provider === 'fonnte') {
+    gatewayUrl = 'https://api.fonnte.com/send';
+  }
+
+  if (!gatewayUrl) {
+    return { status: 'error', sent: false, message: 'URL WA Gateway belum dikonfigurasi di Script Properties (WA_GATEWAY_URL) atau Pengaturan.' };
+  }
+
+  if (provider !== 'webhook') {
+    if (!token) {
+      return { status: 'error', sent: false, message: 'WA_GATEWAY_TOKEN belum diisi di Script Properties Apps Script.' };
+    }
+    if (!groupId) {
+      return { status: 'error', sent: false, message: 'ID Grup WA (WA_GROUP_ID, contoh: 120363xxx@g.us) belum diisi di Pengaturan atau Script Properties.' };
+    }
+  }
+
+  var options = {
+    method: 'post',
+    muteHttpExceptions: true
+  };
+
+  if (provider === 'fonnte') {
+    options.headers = { Authorization: token };
+    options.payload = {
+      target: groupId,
+      message: messageText
+    };
+  } else if (provider === 'wablas') {
+    options.headers = { Authorization: token };
+    options.contentType = 'application/json';
+    options.payload = JSON.stringify({
+      phone: groupId,
+      message: messageText,
+      isGroup: true
+    });
+  } else {
+    if (token) {
+      options.headers = { Authorization: 'Bearer ' + token };
+    }
+    options.contentType = 'application/json';
+    options.payload = JSON.stringify({
+      groupId: groupId,
+      groupLink: groupLink,
+      message: messageText,
+      tanggal: meta && meta.tanggal ? meta.tanggal : '',
+      hari: meta && meta.hari ? meta.hari : '',
+      belumAbsenCount: meta && meta.totalBelumAbsen !== undefined ? meta.totalBelumAbsen : 0
+    });
+  }
+
+  try {
+    var response = UrlFetchApp.fetch(gatewayUrl, options);
+    var code = response.getResponseCode();
+    var body = response.getContentText();
+    var ok = code >= 200 && code < 300;
+    return {
+      status: ok ? 'success' : 'error',
+      sent: ok,
+      httpCode: code,
+      gatewayResponse: body,
+      message: ok
+        ? 'Pengingat WA berhasil dikirim otomatis ke grup sekolah melalui ' + provider.toUpperCase() + '.'
+        : 'Gateway merespons HTTP ' + code + ': ' + body
+    };
+  } catch (err) {
+    return {
+      status: 'error',
+      sent: false,
+      message: 'Gagal menghubungi WA Gateway: ' + (err.message || String(err))
+    };
+  }
+}
+
+function kirimPengingatWaBelumAbsenSekarang(forceSend, customMessage, customAppUrl) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) return { status: 'error', sent: false, message: 'Spreadsheet tidak ditemukan.' };
+  var data = buildWaReminder0830Data(ss, customAppUrl);
+  if (data.isHoliday && !forceSend) {
+    return { status: 'success', sent: false, totalBelumAbsen: 0, message: data.messageText, preview: data.messageText };
+  }
+  if (data.totalBelumAbsen === 0 && !forceSend) {
+    return { status: 'success', sent: false, totalBelumAbsen: 0, message: 'Semua guru/staf wajib hadir sudah presensi. Tidak perlu mengirim pengingat.', preview: data.messageText };
+  }
+  var msgToSend = (customMessage && String(customMessage).trim()) ? String(customMessage).trim() : data.messageText;
+  var gwRes = sendWaViaGateway(ss, msgToSend, data);
+  if (gwRes.sent) {
+    var props = PropertiesService.getScriptProperties();
+    props.setProperty('LAST_WA_REMINDER_DATE', data.tanggal);
+    props.setProperty('LAST_WA_REMINDER_STATUS', 'Terkirim (' + data.totalBelumAbsen + ' belum absen) pada ' + Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone() || 'Asia/Jakarta', 'HH:mm:ss'));
+  }
+  return {
+    status: gwRes.status,
+    sent: gwRes.sent,
+    totalBelumAbsen: data.totalBelumAbsen,
+    message: gwRes.message,
+    preview: msgToSend
+  };
+}
+
+function cekDanKirimPengingatWa0830() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) return 0;
+  ensureSheets(ss);
+
+  var cfg = getSettingsData(ss) || {};
+  if (String(cfg.waReminderEnabled || 'true').toLowerCase() === 'false') {
+    return 0;
+  }
+
+  var tz = ss.getSpreadsheetTimeZone() || 'Asia/Jakarta';
+  var now = new Date();
+  var todayISO = Utilities.formatDate(now, tz, 'yyyy-MM-dd');
+  var dayNames = ['Ahad', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+  if (dayNames[now.getDay()] === 'Jumat') return 0;
+
+  var props = PropertiesService.getScriptProperties();
+  if (props.getProperty('LAST_WA_REMINDER_DATE') === todayISO) {
+    return 0;
+  }
+
+  var reminderJam = String(cfg.waReminderJam || '08:30').trim() || '08:30';
+  var targetMins = parseTimeMinutesGs(reminderJam);
+  if (targetMins === null) targetMins = 510; // 08:30
+  var nowMins = now.getHours() * 60 + now.getMinutes();
+
+  // Jalankan tepat di jendela waktu mulai pukul 08:30 (sampai +75 menit jika trigger sedikit bergeser)
+  if (nowMins < targetMins || nowMins > targetMins + 75) {
+    return 0;
+  }
+
+  var gwStatus = getWaGatewayStatus(ss);
+  if (!gwStatus.configured) {
+    Logger.log('Pengingat WA 08:30 dilewati: WA_GATEWAY_TOKEN / WA_GROUP_ID belum diatur.');
+    return 0;
+  }
+
+  var res = kirimPengingatWaBelumAbsenSekarang(false, '', '');
+  Logger.log('cekDanKirimPengingatWa0830: ' + JSON.stringify(res));
+  return res.sent ? 1 : 0;
 }
 
 function findSheetFlexible(ss, targetNames, keywords) {
@@ -888,6 +1834,27 @@ function ensureSheets(ss) {
   }
 
   ensureCutiSheet(ss);
+  ensureSpSheet(ss);
+}
+
+function ensureSpSheet(ss) {
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) return null;
+  var spSheet = findSheetFlexible(ss, ['Data_SP', 'Data SP'], ['data_sp', 'surat_peringatan']);
+  if (!spSheet) {
+    spSheet = ss.insertSheet('Data_SP');
+    spSheet.appendRow([
+      'ID Surat', 'Waktu Dibuat', 'Nomor Surat', 'Tanggal Surat', 'Tahap',
+      'Jenis Dokumen', 'Penerbit', 'Urutan Ke', 'Nama', 'NIP / NTY',
+      'Jabatan', 'Mata Pelajaran', 'Lokasi Pertemuan', 'Alasan Utama',
+      'Tanggal Rapat Absen', 'Periode Bulan', 'Persentase Kehadiran',
+      'Pelanggaran Lainnya', 'Catatan Klarifikasi', 'Disertai Pemanggilan',
+      'Tanggal Pemanggilan', 'Jam Pemanggilan', 'Tempat Pemanggilan',
+      'Riwayat Terkait', 'Penandatangan', 'NIP Penandatangan', 'Status Tindak Lanjut',
+      'Rincian Pelanggaran'
+    ]);
+  }
+  return spSheet;
 }
 
 function ensureCutiSheet(ss) {
@@ -1350,6 +2317,65 @@ function getCutiData(ss) {
   return result;
 }
 
+function getSpData(ss) {
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) return [];
+  var sheet = ensureSpSheet(ss);
+  if (!sheet) return [];
+  var rows = sheet.getDataRange().getValues();
+  var displayRows = sheet.getDataRange().getDisplayValues();
+  if (rows.length <= 1) return [];
+
+  var result = [];
+  for (var i = 1; i < rows.length; i++) {
+    var r = rows[i];
+    var d = displayRows[i] || [];
+    var namaVal = String(d[8] !== undefined && d[8] !== '' ? d[8] : (r[8] || '')).trim();
+    if (!namaVal) continue;
+
+    var tglSurat = d[3] ? formatDate(d[3]) : formatDate(r[3]);
+    var tglRapat = d[14] ? formatDate(d[14]) : formatDate(r[14]);
+    var tglPanggil = d[20] ? formatDate(d[20]) : formatDate(r[20]);
+    var urutan = parseInt(String(d[7] || r[7] || '1'), 10);
+    if (isNaN(urutan) || urutan < 1) urutan = 1;
+
+    var rawPemanggilan = String(d[19] || r[19] || '').trim().toUpperCase();
+    var disertaiPemanggilan = rawPemanggilan === 'YA' || rawPemanggilan === 'TRUE';
+
+    result.push({
+      id: String(d[0] || r[0] || ('SP-' + i)).trim(),
+      waktuDibuat: String(d[1] || r[1] || '').trim(),
+      nomorSurat: String(d[2] || r[2] || '').replace(/^'/, '').trim(),
+      tanggalSurat: tglSurat,
+      tahap: String(d[4] || r[4] || 'Teguran / Pembinaan I').trim(),
+      jenisDokumen: String(d[5] || r[5] || 'berita_acara_pembinaan').trim(),
+      penerbit: String(d[6] || r[6] || 'Waka Kurikulum').trim(),
+      urutanKe: urutan,
+      nama: namaVal,
+      nipNty: String(d[9] || r[9] || '-').replace(/^'/, '').trim(),
+      jabatan: String(d[10] || r[10] || '-').trim(),
+      mataPelajaran: String(d[11] || r[11] || '-').trim(),
+      lokasiPertemuan: String(d[12] || r[12] || 'Ruang Kurikulum SMP Nurul Abror Al-Robbaniyin').trim(),
+      alasanUtama: String(d[13] || r[13] || '').trim(),
+      tanggalRapatAbsen: tglRapat,
+      periodeBulan: String(d[15] || r[15] || '').trim(),
+      persentaseKehadiran: String(d[16] || r[16] || '').trim(),
+      pelanggaranLainnya: String(d[17] || r[17] || '').trim(),
+      catatanKlarifikasi: String(d[18] || r[18] || '').trim(),
+      disertaiPemanggilan: disertaiPemanggilan,
+      tanggalPemanggilan: tglPanggil,
+      jamPemanggilan: String(d[21] || r[21] || '').replace(/^'/, '').trim(),
+      tempatPemanggilan: String(d[22] || r[22] || '').trim(),
+      riwayatTerkait: String(d[23] || r[23] || '').trim(),
+      namaPenandatangan: String(d[24] || r[24] || '').trim(),
+      nipPenandatangan: String(d[25] || r[25] || '').replace(/^'/, '').trim(),
+      statusTindakLanjut: String(d[26] || r[26] || 'Diterbitkan').trim(),
+      rincianPelanggaran: String(d[27] || r[27] || '').trim()
+    });
+  }
+  return result;
+}
+
 function getLogData(ss) {
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) return [];
@@ -1503,6 +2529,8 @@ const STORAGE_KEY_THRESHOLD = 'smp_nurul_abror_threshold';
 const STORAGE_KEY_LOGS = 'smp_nurul_abror_local_logs';
 const STORAGE_KEY_CUTI = 'smp_nurul_abror_local_cuti';
 const STORAGE_KEY_HAS_REMOTE_CUTI = 'smp_nurul_abror_has_remote_cuti';
+const STORAGE_KEY_SP = 'smp_nurul_abror_local_sp_v1';
+const STORAGE_KEY_HAS_REMOTE_SP = 'smp_nurul_abror_has_remote_sp_v1';
 const STORAGE_KEY_MASTER = 'smp_nurul_abror_local_master';
 const STORAGE_KEY_GURU_TOLERANSI = 'smp_nurul_abror_guru_toleransi_menit_v1';
 const STORAGE_KEY_GURU_TANPA_JADWAL = 'smp_nurul_abror_guru_tanpa_jadwal_wajib_hadir_v1';
@@ -1522,6 +2550,30 @@ const STORAGE_KEY_KEBIJAKAN = 'smp_nurul_abror_kebijakan_kehadiran';
 export const STORAGE_KEY_JADWAL_TAHUN = 'smp_nurul_abror_jadwal_tahun_ajaran';
 export const STORAGE_KEY_JADWAL_SEMESTER = 'smp_nurul_abror_jadwal_semester';
 const STORAGE_KEY_ATTENDANCE_OVERRIDES = 'smp_nurul_abror_attendance_rule_overrides_v1';
+const STORAGE_KEY_AUTO_ALPA_ENABLED = 'smp_nurul_abror_auto_alpa_enabled_v1';
+const STORAGE_KEY_AUTO_ALPA_GRACE = 'smp_nurul_abror_auto_alpa_grace_v1';
+const STORAGE_KEY_AUTO_ALPA_MODE = 'smp_nurul_abror_auto_alpa_mode_v1';
+const STORAGE_KEY_AUTO_ALPA_BATAS_JAM = 'smp_nurul_abror_auto_alpa_batas_jam_v1';
+const STORAGE_KEY_AUTO_ALPA_MULAI = 'smp_nurul_abror_auto_alpa_mulai_v1';
+const STORAGE_KEY_WA_GROUP_URL = 'smp_nurul_abror_wa_group_url_v1';
+const STORAGE_KEY_WA_REMINDER_ENABLED = 'smp_nurul_abror_wa_reminder_enabled_v1';
+const STORAGE_KEY_WA_REMINDER_JAM = 'smp_nurul_abror_wa_reminder_jam_v1';
+const STORAGE_KEY_WA_GATEWAY_PROVIDER = 'smp_nurul_abror_wa_gateway_provider_v1';
+const STORAGE_KEY_WA_GATEWAY_URL = 'smp_nurul_abror_wa_gateway_url_v1';
+const STORAGE_KEY_WA_GROUP_ID = 'smp_nurul_abror_wa_group_id_v1';
+const STORAGE_KEY_WA_APP_URL = 'smp_nurul_abror_wa_app_url_v1';
+
+export const DEFAULT_WHATSAPP_GROUP_URL = 'https://chat.whatsapp.com/B8rLv6MTwFeHVf8Ejm70jC';
+
+export interface WaGatewayStatus {
+  configured: boolean;
+  provider?: string;
+  hasToken?: boolean;
+  hasGroupId?: boolean;
+  hasGatewayUrl?: boolean;
+  lastSentDate?: string;
+  lastStatus?: string;
+}
 
 export const MASTER_SCHEMA_VERSION_KEY = 'smp_nurul_abror_master_schema_v3';
 export const CURRENT_MASTER_SCHEMA_VERSION = 'v2026_10_12_jadwal_fiqih_zaini_v8_permanent';
@@ -1712,6 +2764,38 @@ export function getStoredSettings(): AppSettings {
     attendanceRuleOverrides = {};
   }
 
+  const autoAlpaEnabled = typeof window !== 'undefined'
+    ? localStorage.getItem(STORAGE_KEY_AUTO_ALPA_ENABLED) !== 'false'
+    : true;
+  const autoAlpaGraceMenit = typeof window !== 'undefined'
+    ? (parseInt(localStorage.getItem(STORAGE_KEY_AUTO_ALPA_GRACE) || '90', 10) || 90)
+    : 90;
+  const rawAutoMode = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY_AUTO_ALPA_MODE) : null;
+  const autoAlpaCutoffMode: 'setelah_jam_masuk' | 'batas_akhir_tetap' =
+    rawAutoMode === 'batas_akhir_tetap' ? 'batas_akhir_tetap' : 'setelah_jam_masuk';
+  const autoAlpaBatasAkhirJam = (typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY_AUTO_ALPA_BATAS_JAM) : null) || '09:00';
+  let autoAlpaMulaiTanggal = typeof window !== 'undefined' ? (localStorage.getItem(STORAGE_KEY_AUTO_ALPA_MULAI) || '') : '';
+  if (!autoAlpaMulaiTanggal && typeof window !== 'undefined') {
+    const nowD = new Date();
+    autoAlpaMulaiTanggal = `${nowD.getFullYear()}-${String(nowD.getMonth() + 1).padStart(2, '0')}-${String(nowD.getDate()).padStart(2, '0')}`;
+    localStorage.setItem(STORAGE_KEY_AUTO_ALPA_MULAI, autoAlpaMulaiTanggal);
+  }
+  const whatsappGroupUrl =
+    (typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY_WA_GROUP_URL) : null) ||
+    DEFAULT_WHATSAPP_GROUP_URL;
+  const waReminderEnabled = typeof window !== 'undefined'
+    ? localStorage.getItem(STORAGE_KEY_WA_REMINDER_ENABLED) !== 'false'
+    : true;
+  const waReminderJam = (typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY_WA_REMINDER_JAM) : null) || '08:30';
+  const rawProvider = typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY_WA_GATEWAY_PROVIDER) : null;
+  const waGatewayProvider: 'fonnte' | 'wablas' | 'webhook' =
+    rawProvider === 'wablas' || rawProvider === 'webhook' ? rawProvider : 'fonnte';
+  const waGatewayUrl = (typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY_WA_GATEWAY_URL) : null) || '';
+  const waGroupId = (typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY_WA_GROUP_ID) : null) || '';
+  const waAppPublicUrl =
+    (typeof window !== 'undefined' ? localStorage.getItem(STORAGE_KEY_WA_APP_URL) : null) ||
+    (typeof window !== 'undefined' ? `${window.location.origin}${window.location.pathname}` : '');
+
   return {
     webAppUrl,
     sheetUrl,
@@ -1733,7 +2817,19 @@ export function getStoredSettings(): AppSettings {
     requireDeviceLock,
     jadwalTahunAjaran,
     jadwalSemester,
-    attendanceRuleOverrides
+    attendanceRuleOverrides,
+    autoAlpaEnabled,
+    autoAlpaGraceMenit,
+    autoAlpaCutoffMode,
+    autoAlpaBatasAkhirJam,
+    autoAlpaMulaiTanggal,
+    whatsappGroupUrl,
+    waReminderEnabled,
+    waReminderJam,
+    waGatewayProvider,
+    waGatewayUrl,
+    waGroupId,
+    waAppPublicUrl
   };
 }
 
@@ -1761,6 +2857,18 @@ export function saveStoredSettings(settings: Partial<AppSettings>) {
   if (settings.attendanceRuleOverrides !== undefined) {
     localStorage.setItem(STORAGE_KEY_ATTENDANCE_OVERRIDES, JSON.stringify(settings.attendanceRuleOverrides || {}));
   }
+  if (settings.autoAlpaEnabled !== undefined) localStorage.setItem(STORAGE_KEY_AUTO_ALPA_ENABLED, String(settings.autoAlpaEnabled));
+  if (settings.autoAlpaGraceMenit !== undefined) localStorage.setItem(STORAGE_KEY_AUTO_ALPA_GRACE, String(settings.autoAlpaGraceMenit));
+  if (settings.autoAlpaCutoffMode !== undefined) localStorage.setItem(STORAGE_KEY_AUTO_ALPA_MODE, settings.autoAlpaCutoffMode);
+  if (settings.autoAlpaBatasAkhirJam !== undefined) localStorage.setItem(STORAGE_KEY_AUTO_ALPA_BATAS_JAM, settings.autoAlpaBatasAkhirJam.trim());
+  if (settings.autoAlpaMulaiTanggal !== undefined) localStorage.setItem(STORAGE_KEY_AUTO_ALPA_MULAI, settings.autoAlpaMulaiTanggal.trim());
+  if (settings.whatsappGroupUrl !== undefined) localStorage.setItem(STORAGE_KEY_WA_GROUP_URL, settings.whatsappGroupUrl.trim());
+  if (settings.waReminderEnabled !== undefined) localStorage.setItem(STORAGE_KEY_WA_REMINDER_ENABLED, String(settings.waReminderEnabled));
+  if (settings.waReminderJam !== undefined) localStorage.setItem(STORAGE_KEY_WA_REMINDER_JAM, settings.waReminderJam.trim());
+  if (settings.waGatewayProvider !== undefined) localStorage.setItem(STORAGE_KEY_WA_GATEWAY_PROVIDER, settings.waGatewayProvider);
+  if (settings.waGatewayUrl !== undefined) localStorage.setItem(STORAGE_KEY_WA_GATEWAY_URL, settings.waGatewayUrl.trim());
+  if (settings.waGroupId !== undefined) localStorage.setItem(STORAGE_KEY_WA_GROUP_ID, settings.waGroupId.trim());
+  if (settings.waAppPublicUrl !== undefined) localStorage.setItem(STORAGE_KEY_WA_APP_URL, settings.waAppPublicUrl.trim());
 }
 
 export function resetMasterDataToOfficial(): MasterGuruStaf[] {
@@ -1924,6 +3032,44 @@ function parseRemoteSettings(raw: Record<string, any>): Partial<AppSettings> {
       // ignore invalid remote JSON
     }
   }
+  if (raw.autoAlpaEnabled !== undefined) {
+    result.autoAlpaEnabled = raw.autoAlpaEnabled === true || String(raw.autoAlpaEnabled).toLowerCase() === 'true';
+  }
+  if (raw.autoAlpaGraceMenit !== undefined) {
+    result.autoAlpaGraceMenit = parseInt(String(raw.autoAlpaGraceMenit), 10) || 90;
+  }
+  if (raw.autoAlpaCutoffMode === 'setelah_jam_masuk' || raw.autoAlpaCutoffMode === 'batas_akhir_tetap') {
+    result.autoAlpaCutoffMode = raw.autoAlpaCutoffMode;
+  }
+  if (raw.autoAlpaBatasAkhirJam) {
+    const parsedJam = parseAndFormat24hTime(String(raw.autoAlpaBatasAkhirJam).trim());
+    result.autoAlpaBatasAkhirJam = parsedJam.isValid && parsedJam.formatted ? parsedJam.formatted : String(raw.autoAlpaBatasAkhirJam).trim();
+  }
+  if (raw.autoAlpaMulaiTanggal) {
+    result.autoAlpaMulaiTanggal = String(raw.autoAlpaMulaiTanggal).trim();
+  }
+  if (raw.whatsappGroupUrl) {
+    result.whatsappGroupUrl = String(raw.whatsappGroupUrl).trim();
+  }
+  if (raw.waReminderEnabled !== undefined) {
+    result.waReminderEnabled = raw.waReminderEnabled === true || String(raw.waReminderEnabled).toLowerCase() === 'true';
+  }
+  if (raw.waReminderJam) {
+    const parsedRemJam = parseAndFormat24hTime(String(raw.waReminderJam).trim());
+    result.waReminderJam = parsedRemJam.isValid && parsedRemJam.formatted ? parsedRemJam.formatted : String(raw.waReminderJam).trim();
+  }
+  if (raw.waGatewayProvider === 'fonnte' || raw.waGatewayProvider === 'wablas' || raw.waGatewayProvider === 'webhook') {
+    result.waGatewayProvider = raw.waGatewayProvider;
+  }
+  if (raw.waGatewayUrl !== undefined) {
+    result.waGatewayUrl = String(raw.waGatewayUrl).trim();
+  }
+  if (raw.waGroupId !== undefined) {
+    result.waGroupId = String(raw.waGroupId).trim();
+  }
+  if (raw.waAppPublicUrl !== undefined) {
+    result.waAppPublicUrl = String(raw.waAppPublicUrl).trim();
+  }
   return result;
 }
 
@@ -1949,6 +3095,30 @@ export function saveLocalCutiData(list: DataCutiRecord[]) {
 export function hasRemoteCutiSheetSupport(): boolean {
   if (typeof window === 'undefined') return false;
   return localStorage.getItem(STORAGE_KEY_HAS_REMOTE_CUTI) === 'true';
+}
+
+export function getLocalSpData(): DataSpRecord[] {
+  if (typeof window === 'undefined') return [];
+  const stored = localStorage.getItem(STORAGE_KEY_SP);
+  if (stored) {
+    try {
+      const parsed = JSON.parse(stored);
+      if (Array.isArray(parsed)) return parsed;
+    } catch (e) {
+      console.error(e);
+    }
+  }
+  return [];
+}
+
+export function saveLocalSpData(list: DataSpRecord[]) {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem(STORAGE_KEY_SP, JSON.stringify(list));
+}
+
+export function hasRemoteSpSheetSupport(): boolean {
+  if (typeof window === 'undefined') return false;
+  return localStorage.getItem(STORAGE_KEY_HAS_REMOTE_SP) === 'true';
 }
 
 /**
@@ -2017,7 +3187,10 @@ export async function fetchRemoteData(webAppUrl: string): Promise<{
   logs: LogPresensi[];
   cuti?: DataCutiRecord[];
   hasRemoteCutiSheet?: boolean;
+  sp?: DataSpRecord[];
+  hasRemoteSpSheet?: boolean;
   settings?: Partial<AppSettings>;
+  waGatewayStatus?: WaGatewayStatus;
   jadwal?: JadwalSlot[];
   jadwalAktif?: { tahunAjaran: string; semester: string };
   terms?: Array<{ tahunAjaran: string; semester: string }>;
@@ -2033,6 +3206,8 @@ export async function fetchRemoteData(webAppUrl: string): Promise<{
       logs: localLogs,
       cuti: localCuti.length > 0 ? localCuti : deriveCutiFromLogs(localLogs),
       hasRemoteCutiSheet: false,
+      sp: getLocalSpData(),
+      hasRemoteSpSheet: false,
       jadwal: getLocalJadwal(),
       message: 'Mode Demo/Lokal (Belum ada URL Apps Script)'
     };
@@ -2072,6 +3247,47 @@ export async function fetchRemoteData(webAppUrl: string): Promise<{
         cutiList = getLocalCutiData();
       }
 
+      const hasRemoteSp = Array.isArray(json.sp);
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(STORAGE_KEY_HAS_REMOTE_SP, hasRemoteSp ? 'true' : 'false');
+      }
+      let spList: DataSpRecord[];
+      if (hasRemoteSp) {
+        spList = (json.sp as any[]).map((item) => ({
+          id: String(item.id || ''),
+          waktuDibuat: String(item.waktuDibuat || ''),
+          nomorSurat: String(item.nomorSurat || ''),
+          tanggalSurat: String(item.tanggalSurat || ''),
+          tahap: (item.tahap || 'Teguran / Pembinaan I') as SpTahap,
+          jenisDokumen: (item.jenisDokumen || 'berita_acara_pembinaan') as SpJenisDokumen,
+          penerbit: (item.penerbit || 'Waka Kurikulum') as SpPenerbit,
+          urutanKe: Number(item.urutanKe) || 1,
+          nama: String(item.nama || ''),
+          nipNty: String(item.nipNty || '-'),
+          jabatan: String(item.jabatan || '-'),
+          mataPelajaran: String(item.mataPelajaran || '-'),
+          lokasiPertemuan: String(item.lokasiPertemuan || 'Ruang Kurikulum SMP Nurul Abror Al-Robbaniyin'),
+          alasanUtama: String(item.alasanUtama || ''),
+          tanggalRapatAbsen: String(item.tanggalRapatAbsen || ''),
+          periodeBulan: String(item.periodeBulan || ''),
+          persentaseKehadiran: String(item.persentaseKehadiran || ''),
+          pelanggaranLainnya: String(item.pelanggaranLainnya || ''),
+          catatanKlarifikasi: String(item.catatanKlarifikasi || ''),
+          disertaiPemanggilan: Boolean(item.disertaiPemanggilan),
+          tanggalPemanggilan: String(item.tanggalPemanggilan || ''),
+          jamPemanggilan: String(item.jamPemanggilan || ''),
+          tempatPemanggilan: String(item.tempatPemanggilan || ''),
+          riwayatTerkait: String(item.riwayatTerkait || ''),
+          rincianPelanggaran: String(item.rincianPelanggaran || ''),
+          namaPenandatangan: String(item.namaPenandatangan || ''),
+          nipPenandatangan: String(item.nipPenandatangan || ''),
+          statusTindakLanjut: (item.statusTindakLanjut || 'Diterbitkan') as SpStatusTindakLanjut
+        }));
+        saveLocalSpData(spList);
+      } else {
+        spList = getLocalSpData();
+      }
+
       if (json.jadwal && Array.isArray(json.jadwal) && json.jadwal.length > 0) {
         saveLocalJadwal(json.jadwal);
       }
@@ -2098,7 +3314,10 @@ export async function fetchRemoteData(webAppUrl: string): Promise<{
         logs,
         cuti: cutiList,
         hasRemoteCutiSheet: hasRemoteCuti,
+        sp: spList,
+        hasRemoteSpSheet: hasRemoteSp,
         settings: remoteSettings,
+        waGatewayStatus: json.waGatewayStatus,
         jadwal,
         jadwalAktif: json.jadwalAktif,
         terms: json.terms,
@@ -2112,6 +3331,8 @@ export async function fetchRemoteData(webAppUrl: string): Promise<{
         logs: getLocalLogs(),
         cuti: getLocalCutiData(),
         hasRemoteCutiSheet: false,
+        sp: getLocalSpData(),
+        hasRemoteSpSheet: false,
         jadwal: getLocalJadwal(),
         message: json?.message || `Gagal mengambil data dari Google Apps Script (HTTP ${res.status}).`
       };
@@ -2124,6 +3345,8 @@ export async function fetchRemoteData(webAppUrl: string): Promise<{
       logs: getLocalLogs(),
       cuti: getLocalCutiData(),
       hasRemoteCutiSheet: false,
+      sp: getLocalSpData(),
+      hasRemoteSpSheet: false,
       jadwal: getLocalJadwal(),
       message: `Koneksi ke Apps Script gagal: ${err.message || 'CORS / Network Error'}. Menggunakan data lokal.`
     };
@@ -2299,6 +3522,116 @@ export async function batchUpsertLogs(
     return {
       success: false,
       message: `Gagal sync Google Sheets (${err.message || 'Koneksi error'}). Tersimpan di browser.`
+    };
+  }
+}
+
+/**
+ * Safely inserts Auto-Alpa logs ONLY when the teacher/date does not already exist in Log_Presensi.
+ * Prevents overwriting recent scans during concurrent access.
+ */
+export async function postBatchAutoAlpa(
+  webAppUrl: string,
+  autoAlpaLogs: LogPresensi[]
+): Promise<{ success: boolean; inserted: number; skipped: number; message: string }> {
+  if (!autoAlpaLogs || autoAlpaLogs.length === 0) {
+    return { success: true, inserted: 0, skipped: 0, message: 'Tidak ada data Auto-Alpa yang perlu dicatat.' };
+  }
+
+  // Merge insert-only into local storage first (never overwrite existing log for the same teacher & date)
+  const currentLogs = getLocalLogs();
+  const existingKeys = new Set(
+    currentLogs.map((l) => `${l.nama.trim().toLowerCase()}_${l.tanggal.trim()}`)
+  );
+  const newEntries: LogPresensi[] = [];
+  for (const item of autoAlpaLogs) {
+    const k = `${item.nama.trim().toLowerCase()}_${item.tanggal.trim()}`;
+    if (!existingKeys.has(k)) {
+      existingKeys.add(k);
+      newEntries.push(item);
+    }
+  }
+  if (newEntries.length === 0) {
+    return { success: true, inserted: 0, skipped: autoAlpaLogs.length, message: 'Semua sudah tercatat.' };
+  }
+  saveLocalLogs([...newEntries, ...currentLogs]);
+
+  if (!webAppUrl) {
+    return {
+      success: true,
+      inserted: newEntries.length,
+      skipped: autoAlpaLogs.length - newEntries.length,
+      message: `${newEntries.length} catatan Tidak Hadir otomatis disimpan (Mode Demo Lokal).`
+    };
+  }
+
+  try {
+    const res = await fetch(webAppUrl, {
+      method: 'POST',
+      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: 'batchAutoAlpa',
+        logs: newEntries
+      })
+    });
+    const rawText = await res.text();
+    let json: any = null;
+    try {
+      json = JSON.parse(rawText);
+    } catch (e) {}
+
+    if (res.ok && json && json.status === 'success') {
+      return {
+        success: true,
+        inserted: Number(json.inserted) || newEntries.length,
+        skipped: Number(json.skipped) || 0,
+        message: json.message || `${newEntries.length} catatan Tidak Hadir otomatis tersimpan ke Google Sheets.`
+      };
+    }
+
+    // Fallback bila Code.gs di Sheets masih versi lama (belum mendukung batchAutoAlpa):
+    // Fetch log terbaru dari Sheets agar tidak menimpa guru yang baru saja scan, lalu upsert yang benar-benar belum ada.
+    const msg = String(json?.message || '');
+    if (msg.toLowerCase().includes('aksi tidak dikenali')) {
+      const targetUrl = webAppUrl.includes('?') ? `${webAppUrl}&action=logs` : `${webAppUrl}?action=logs`;
+      const logsRes = await fetch(targetUrl, { method: 'GET', redirect: 'follow' });
+      const logsJson = await logsRes.json().catch(() => null);
+      if (logsRes.ok && logsJson && Array.isArray(logsJson.logs)) {
+        const remoteKeys = new Set(
+          (logsJson.logs as LogPresensi[]).map(
+            (rl) => `${String(rl.nama || '').trim().toLowerCase()}_${String(rl.tanggal || '').trim()}`
+          )
+        );
+        const stillMissing = newEntries.filter(
+          (item) => !remoteKeys.has(`${item.nama.trim().toLowerCase()}_${item.tanggal.trim()}`)
+        );
+        if (stillMissing.length === 0) {
+          saveLocalLogs((logsJson.logs as LogPresensi[]).map(sanitizeLogTime));
+          return { success: true, inserted: 0, skipped: newEntries.length, message: 'Semua sudah tercatat di Google Sheets.' };
+        }
+        const upRes = await batchUpsertLogs(webAppUrl, stillMissing);
+        return {
+          success: upRes.success,
+          inserted: upRes.inserted ?? stillMissing.length,
+          skipped: newEntries.length - stillMissing.length,
+          message: upRes.message
+        };
+      }
+    }
+
+    return {
+      success: false,
+      inserted: 0,
+      skipped: 0,
+      message: msg || `Gagal sync Auto-Alpa ke Sheets (HTTP ${res.status}).`
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      inserted: 0,
+      skipped: 0,
+      message: `Gagal koneksi Auto-Alpa ke Sheets (${err.message || 'Error jaringan'}).`
     };
   }
 }
@@ -2910,6 +4243,126 @@ export async function deleteCutiRemote(
 }
 
 /**
+ * Revokes / finishes an active Cuti early starting from `effectiveDate`:
+ * - Updates Data_Cuti (`statusPengajuan = 'Dicabut'`, shortens `tanggalSelesai` to the day before return)
+ * - Removes daily 'Cuti' rows from `Log_Presensi` for dates >= `effectiveDate` while preserving past days.
+ * Includes automatic fallback (`postSaveCuti` + `deleteLogEntry`) if Code.gs hasn't been redeployed yet.
+ */
+export async function revokeCutiRemote(
+  webAppUrl: string,
+  params: {
+    originalRecord: DataCutiRecord;
+    updatedRecord: DataCutiRecord;
+    effectiveDate: string;
+  }
+): Promise<{ success: boolean; syncedToSheet: boolean; needsScriptUpdate?: boolean; deletedLogCount: number; message: string }> {
+  const { originalRecord, updatedRecord, effectiveDate } = params;
+  const targetName = originalRecord.nama.trim().toLowerCase();
+  const oldEnd = (originalRecord.tanggalSelesai || originalRecord.tanggalMulai).trim();
+
+  // 1. Update local Data_Cuti list
+  const currentCuti = getLocalCutiData();
+  const nextCuti = [updatedRecord, ...currentCuti.filter((c) => c.id !== updatedRecord.id)];
+  saveLocalCutiData(nextCuti);
+
+  // 2. Remove matching 'Cuti' logs from local storage starting at effectiveDate
+  const currentLogs = getLocalLogs();
+  const logsToDeleteRemote: LogPresensi[] = [];
+  const filteredLogs = currentLogs.filter((l) => {
+    const isTargetCuti =
+      l.nama.trim().toLowerCase() === targetName &&
+      l.status === 'Cuti' &&
+      l.tanggal >= effectiveDate &&
+      (!oldEnd || l.tanggal <= oldEnd);
+    if (isTargetCuti) {
+      logsToDeleteRemote.push(l);
+      return false;
+    }
+    return true;
+  });
+  saveLocalLogs(filteredLogs);
+
+  if (!webAppUrl) {
+    return {
+      success: true,
+      syncedToSheet: false,
+      deletedLogCount: logsToDeleteRemote.length,
+      message: `Cuti ${originalRecord.nama} dicabut mulai ${effectiveDate} (${logsToDeleteRemote.length} log Cuti lokal dihapus). Guru sudah dapat melakukan presensi normal.`
+    };
+  }
+
+  try {
+    const res = await fetch(webAppUrl, {
+      method: 'POST',
+      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: 'revokeCuti',
+        id: originalRecord.id,
+        nama: originalRecord.nama,
+        effectiveDate,
+        oldTanggalSelesai: oldEnd,
+        newTanggalSelesai: updatedRecord.tanggalSelesai,
+        newJumlahHariEfektif: updatedRecord.jumlahHariEfektif,
+        statusPengajuan: updatedRecord.statusPengajuan,
+        catatan: updatedRecord.catatan
+      })
+    });
+    const rawText = await res.text();
+    let json: any = null;
+    try {
+      json = JSON.parse(rawText);
+    } catch (e) {}
+
+    if (res.ok && json && json.status === 'success') {
+      return {
+        success: true,
+        syncedToSheet: true,
+        deletedLogCount: Number(json.deletedLogRows ?? logsToDeleteRemote.length),
+        message:
+          json.message ||
+          `Cuti ${originalRecord.nama} berhasil dicabut mulai ${effectiveDate}. Presensi normal telah aktif kembali.`
+      };
+    }
+
+    const msg = String(json?.message || '');
+    if (msg.toLowerCase().includes('aksi tidak dikenali')) {
+      // Fallback for older Code.gs deployments: save updated Data_Cuti + delete each removed Cuti log individually
+      const saveRes = await postSaveCuti(webAppUrl, updatedRecord);
+      let deletedCount = 0;
+      for (const l of logsToDeleteRemote) {
+        if (l.id) {
+          await deleteLogEntry(webAppUrl, l.id);
+          deletedCount++;
+        }
+      }
+      return {
+        success: true,
+        syncedToSheet: saveRes.syncedToSheet,
+        needsScriptUpdate: saveRes.needsScriptUpdate,
+        deletedLogCount: deletedCount,
+        message: `Cuti ${originalRecord.nama} berhasil dicabut mulai ${effectiveDate} (${deletedCount} baris log Cuti dihapus). Guru sudah aktif kembali untuk presensi.`
+      };
+    }
+
+    return {
+      success: true,
+      syncedToSheet: false,
+      deletedLogCount: logsToDeleteRemote.length,
+      message: `Dicabut di aplikasi lokal (${msg || `HTTP ${res.status}`}).`
+    };
+  } catch (err: any) {
+    return {
+      success: true,
+      syncedToSheet: false,
+      deletedLogCount: logsToDeleteRemote.length,
+      message: `Cuti dicabut di penyimpanan lokal (${err.message || 'Error jaringan'}).`
+    };
+  }
+}
+
+
+/**
  * Batch syncs summary Cuti records to sheet Data_Cuti in Google Sheets.
  */
 export async function syncCutiRecordsRemote(
@@ -2985,6 +4438,182 @@ export async function syncCutiRecordsRemote(
     };
   }
 }
+
+/**
+ * Saves or updates an SP / Pembinaan record to Data_SP sheet and local storage.
+ */
+export async function postSaveSp(
+  webAppUrl: string,
+  spRecord: DataSpRecord
+): Promise<{ success: boolean; syncedToSheet: boolean; needsScriptUpdate?: boolean; message: string }> {
+  const current = getLocalSpData();
+  const updated = [spRecord, ...current.filter((s) => s.id !== spRecord.id)];
+  saveLocalSpData(updated);
+
+  if (!webAppUrl) {
+    return {
+      success: true,
+      syncedToSheet: false,
+      message: 'Catatan & Nomor Surat tersimpan secara lokal (Mode Demo).'
+    };
+  }
+
+  try {
+    const res = await fetch(webAppUrl, {
+      method: 'POST',
+      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: 'saveSp',
+        data: spRecord
+      })
+    });
+    const rawText = await res.text();
+    let json: any = null;
+    try {
+      json = JSON.parse(rawText);
+    } catch (e) {}
+
+    if (res.ok && json && json.status === 'success') {
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(STORAGE_KEY_HAS_REMOTE_SP, 'true');
+      }
+      return {
+        success: true,
+        syncedToSheet: true,
+        message: json.message || 'Nomor Surat & catatan SP tersimpan ke sheet Data_SP.'
+      };
+    }
+
+    const msg = String(json?.message || '');
+    const needsUpdate = msg.toLowerCase().includes('aksi tidak dikenali');
+    return {
+      success: true,
+      syncedToSheet: false,
+      needsScriptUpdate: needsUpdate,
+      message: needsUpdate
+        ? 'Tersimpan di browser ini. Perbarui Code.gs di Google Sheets agar otomatis membuat sheet Data_SP.'
+        : `Tersimpan lokal (${msg || `HTTP ${res.status}`}).`
+    };
+  } catch (err: any) {
+    return {
+      success: true,
+      syncedToSheet: false,
+      message: `Catatan tersimpan di browser (${err.message || 'Error jaringan'}).`
+    };
+  }
+}
+
+/**
+ * Deletes an SP / Pembinaan record from Data_SP sheet and local storage.
+ */
+export async function deleteSpRemote(
+  webAppUrl: string,
+  id: string
+): Promise<{ success: boolean; message: string }> {
+  const current = getLocalSpData();
+  saveLocalSpData(current.filter((s) => s.id !== id));
+
+  if (!webAppUrl) {
+    return { success: true, message: 'Catatan surat dihapus dari penyimpanan lokal.' };
+  }
+
+  try {
+    const res = await fetch(webAppUrl, {
+      method: 'POST',
+      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: 'deleteSp',
+        id
+      })
+    });
+    const rawText = await res.text();
+    let json: any = null;
+    try {
+      json = JSON.parse(rawText);
+    } catch (e) {}
+
+    if (res.ok && json && json.status === 'success') {
+      return { success: true, message: json.message || 'Catatan surat dihapus dari sheet Data_SP.' };
+    }
+    return {
+      success: true,
+      message: json?.message || 'Dihapus dari daftar lokal.'
+    };
+  } catch (err: any) {
+    return {
+      success: true,
+      message: 'Dihapus dari penyimpanan lokal.'
+    };
+  }
+}
+
+/**
+ * Triggers automatic WhatsApp Group reminder via Google Apps Script + WA Gateway (Fonnte/Wablas/Webhook).
+ */
+export async function sendWaReminderRemote(
+  webAppUrl: string,
+  params?: { forceSend?: boolean; customMessage?: string; appPublicUrl?: string }
+): Promise<{ success: boolean; sent: boolean; totalBelumAbsen?: number; message: string; preview?: string }> {
+  if (!webAppUrl) {
+    return {
+      success: false,
+      sent: false,
+      message: 'URL Google Apps Script Web App belum diatur di Pengaturan.'
+    };
+  }
+
+  try {
+    const res = await fetch(webAppUrl, {
+      method: 'POST',
+      redirect: 'follow',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        action: 'sendWaReminder',
+        forceSend: params?.forceSend === true,
+        customMessage: params?.customMessage || '',
+        appPublicUrl: params?.appPublicUrl || ''
+      })
+    });
+    const rawText = await res.text();
+    let json: any = null;
+    try {
+      json = JSON.parse(rawText);
+    } catch (e) {}
+
+    if (res.ok && json) {
+      const msg = String(json.message || '');
+      if (msg.toLowerCase().includes('aksi tidak dikenali')) {
+        return {
+          success: false,
+          sent: false,
+          message: 'Code.gs di Google Apps Script belum diperbarui. Salin kode terbaru dari menu Pengaturan Sheets lalu Deploy > New version.'
+        };
+      }
+      return {
+        success: json.status === 'success',
+        sent: Boolean(json.sent),
+        totalBelumAbsen: json.totalBelumAbsen,
+        message: msg || (json.sent ? 'Pengingat WA terkirim.' : 'Pengingat diproses.'),
+        preview: json.preview
+      };
+    }
+
+    return {
+      success: false,
+      sent: false,
+      message: `Gagal menghubungi Apps Script (HTTP ${res.status}).`
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      sent: false,
+      message: `Gagal mengirim pengingat WA via Apps Script: ${err.message || 'Error jaringan'}.`
+    };
+  }
+}
+
 
 
 

@@ -26,6 +26,7 @@ export type ActiveTab =
   | 'master'
   | 'jadwal'
   | 'kelola_jadwal'
+  | 'sp_pembinaan'
   | 'setup'
   | 'diagnostik';
 
@@ -36,6 +37,17 @@ export interface JadwalLogEntry {
   semester: string;
   jumlahBaris: number;
   catatan: string;
+}
+
+export interface SubstituteAssignment {
+  cutiId: string;
+  guruCutiNama: string;
+  guruCutiJabatan?: string;
+  jenisCuti: string;
+  tanggalMulai: string;
+  tanggalSelesai: string;
+  catatan?: string;
+  classNote?: string;
 }
 
 export interface MasterGuruStaf {
@@ -51,6 +63,8 @@ export interface MasterGuruStaf {
   mapelSelasa: string;
   mapelRabu: string;
   mapelKamis: string;
+  isTempSubstitute?: boolean;
+  substitutingFor?: SubstituteAssignment[];
 }
 
 export interface JadwalSlot {
@@ -101,7 +115,54 @@ export interface DataCutiRecord {
   guruPengganti: string;
   nomorSurat: string;
   catatan: string;
-  statusPengajuan: 'Aktif' | 'Selesai' | 'Dibatalkan';
+  statusPengajuan: 'Aktif' | 'Selesai' | 'Dicabut' | 'Dibatalkan';
+}
+
+export type SpTahap =
+  | 'Teguran / Pembinaan I'
+  | 'SP-I'
+  | 'SP-II'
+  | 'SP-III + Pemanggilan';
+
+export type SpJenisDokumen = 'berita_acara_pembinaan' | 'surat_peringatan';
+
+export type SpPenerbit = 'Waka Kurikulum' | 'Kepala Sekolah';
+
+export type SpStatusTindakLanjut =
+  | 'Diterbitkan'
+  | 'Sudah Klarifikasi'
+  | 'Selesai Pembinaan'
+  | 'Eskalasi Kepala Sekolah';
+
+export interface DataSpRecord {
+  id: string;
+  waktuDibuat: string; // YYYY-MM-DD HH:mm:ss
+  nomorSurat: string; // e.g. 001 / SMP.NAA / XI / 2026
+  tanggalSurat: string; // YYYY-MM-DD
+  tahap: SpTahap;
+  jenisDokumen: SpJenisDokumen;
+  penerbit: SpPenerbit;
+  urutanKe: number;
+  nama: string;
+  nipNty: string;
+  jabatan: string;
+  mataPelajaran: string;
+  lokasiPertemuan: string;
+  alasanUtama: string;
+  tanggalRapatAbsen: string;
+  periodeBulan: string;
+  persentaseKehadiran: string;
+  pelanggaranLainnya: string;
+  catatanKlarifikasi: string;
+  disertaiPemanggilan: boolean;
+  tanggalPemanggilan: string;
+  jamPemanggilan: string;
+  tempatPemanggilan: string;
+  riwayatTerkait: string;
+  rincianPelanggaran?: string;
+  namaPenandatangan: string;
+  nipPenandatangan: string;
+  statusTindakLanjut: SpStatusTindakLanjut;
 }
 
 export interface AppSettings {
@@ -128,6 +189,19 @@ export interface AppSettings {
   schoolQrSecret: string; // Secret token for school gate QR code
   requireLocation: boolean; // Enforce GPS radius check
   requireDeviceLock: boolean; // Enforce 1 device 1 scan per day
+  // Auto-Alpa (Otomatis Tidak Hadir setelah batas waktu kedatangan)
+  autoAlpaEnabled?: boolean; // Default: true
+  autoAlpaGraceMenit?: number; // Default: 90 menit setelah jam masuk/jadwal
+  autoAlpaCutoffMode?: 'setelah_jam_masuk' | 'batas_akhir_tetap'; // Default: 'setelah_jam_masuk'
+  autoAlpaBatasAkhirJam?: string; // e.g. '09:00' when autoAlpaCutoffMode === 'batas_akhir_tetap'
+  autoAlpaMulaiTanggal?: string; // YYYY-MM-DD: tanggal mulai berlakunya pencatatan otomatis
+  whatsappGroupUrl?: string; // Link Grup WhatsApp Resmi Sekolah
+  waReminderEnabled?: boolean; // Aktifkan pengingat otomatis pukul 08:30 WIB
+  waReminderJam?: string; // Default '08:30'
+  waGatewayProvider?: 'fonnte' | 'wablas' | 'webhook'; // Provider WA Gateway untuk kirim otomatis di Apps Script
+  waGatewayUrl?: string; // URL endpoint gateway (opsional, default Fonnte)
+  waGroupId?: string; // ID Grup WA tujuan (mis. 120363xxx@g.us)
+  waAppPublicUrl?: string; // Tautan aplikasi untuk dicantumkan dalam pesan pengingat WA
 }
 
 export interface TestApiResponse {

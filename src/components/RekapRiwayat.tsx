@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { AppSettings, JadwalSlot, LogPresensi, StatusPresensi, MasterGuruStaf } from '../types';
-import { determineTeacherPeran } from '../utils/scheduleTimeEvaluator';
+import { determineTeacherPeran, isGuruBkJabatan } from '../utils/scheduleTimeEvaluator';
 import {
   formatDateISO,
   formatLongDateIndonesian,
@@ -258,47 +258,50 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
 
       let hasProblemOnThisLog = false;
 
-      // 1. Terlambat sebagai Staf
-      if (l.statusStaf === 'Terlambat') {
-        item.terlambatStaf++;
-        hasProblemOnThisLog = true;
-      }
+      // Cuti resmi (sudah mengajukan izin cuti & guru pengganti) TIDAK pernah dihitung sebagai pelanggaran
+      if (l.status !== 'Cuti') {
+        // 1. Terlambat sebagai Staf
+        if (l.statusStaf === 'Terlambat') {
+          item.terlambatStaf++;
+          hasProblemOnThisLog = true;
+        }
 
-      // 2. Terlambat Mengajar
-      if (l.statusMengajar === 'Terlambat') {
-        item.terlambatMengajar++;
-        hasProblemOnThisLog = true;
-      }
+        // 2. Terlambat Mengajar
+        if (l.statusMengajar === 'Terlambat') {
+          item.terlambatMengajar++;
+          hasProblemOnThisLog = true;
+        }
 
-      // 3. Terlambat Legacy (tanpa snapshot statusStaf & statusMengajar)
-      const isLegacy = (!l.statusStaf || l.statusStaf === '-') && (!l.statusMengajar || l.statusMengajar === '-');
-      if (isLegacy && l.status === 'Terlambat') {
-        item.terlambatLegacy++;
-        hasProblemOnThisLog = true;
-      }
+        // 3. Terlambat Legacy (tanpa snapshot statusStaf & statusMengajar)
+        const isLegacy = (!l.statusStaf || l.statusStaf === '-') && (!l.statusMengajar || l.statusMengajar === '-');
+        if (isLegacy && l.status === 'Terlambat') {
+          item.terlambatLegacy++;
+          hasProblemOnThisLog = true;
+        }
 
-      // 4. Alpa (Wajib Hadir Staf / Guru BK)
-      if (l.status === 'Alpa (Wajib Hadir Staf)' || l.status === 'Alpa (Wajib Hadir Guru BK)') {
-        item.alpaStaf++;
-        hasProblemOnThisLog = true;
-      }
+        // 4. Alpa (Wajib Hadir Staf / Guru BK)
+        if (l.status === 'Alpa (Wajib Hadir Staf)' || l.status === 'Alpa (Wajib Hadir Guru BK)') {
+          item.alpaStaf++;
+          hasProblemOnThisLog = true;
+        }
 
-      // 5. Alpa (Jadwal Mengajar)
-      if (l.status === 'Alpa (Jadwal Mengajar)') {
-        item.alpaMengajar++;
-        hasProblemOnThisLog = true;
-      }
+        // 5. Alpa (Jadwal Mengajar)
+        if (l.status === 'Alpa (Jadwal Mengajar)') {
+          item.alpaMengajar++;
+          hasProblemOnThisLog = true;
+        }
 
-      // 6. Alpa Umum
-      if (
-        l.status === 'Alpa' ||
-        (l.status.includes('Alpa') &&
-          l.status !== 'Alpa (Wajib Hadir Staf)' &&
-          l.status !== 'Alpa (Wajib Hadir Guru BK)' &&
-          l.status !== 'Alpa (Jadwal Mengajar)')
-      ) {
-        item.alpaUmum++;
-        hasProblemOnThisLog = true;
+        // 6. Alpa Umum
+        if (
+          l.status === 'Alpa' ||
+          (l.status.includes('Alpa') &&
+            l.status !== 'Alpa (Wajib Hadir Staf)' &&
+            l.status !== 'Alpa (Wajib Hadir Guru BK)' &&
+            l.status !== 'Alpa (Jadwal Mengajar)')
+        ) {
+          item.alpaUmum++;
+          hasProblemOnThisLog = true;
+        }
       }
 
       // "Total Hari Bermasalah" = jumlah tanggal UNIK yang memiliki minimal satu keterlambatan atau alpa.
@@ -1009,6 +1012,7 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
                     <tbody className="divide-y divide-slate-200">
                       {filteredLogs.map((log, idx) => {
                         const isLegacy = (!log.statusStaf || log.statusStaf === '-') && (!log.statusMengajar || log.statusMengajar === '-');
+                        const isBkLog = (log.peran || '').toLowerCase().includes('bk') || isGuruBkJabatan(log.jabatan);
                         return (
                           <tr key={log.id} className="hover:bg-slate-50 transition-colors">
                             <td className="px-4 py-3 font-medium text-slate-400">{idx + 1}</td>
@@ -1056,7 +1060,9 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
                                 <div>
                                   {getStatusBadge((log.statusStaf || log.status) as StatusPresensi)}
                                   {log.batasStaf && (
-                                    <div className="text-[10.5px] text-slate-400 font-medium mt-0.5">Batas Staf: {log.batasStaf}</div>
+                                    <div className="text-[10.5px] text-slate-400 font-medium mt-0.5">
+                                      {isBkLog ? 'Batas Guru BK:' : 'Batas Staf:'} {log.batasStaf}
+                                    </div>
                                   )}
                                 </div>
                               ) : viewMode === 'guru' ? (
@@ -1079,7 +1085,7 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
                                   {(log.statusStaf || log.statusMengajar) && (
                                     <div className="text-[10px] text-slate-400 mt-1 flex items-center gap-1.5">
                                       {log.statusStaf && (
-                                        <span>Staf: <strong className={log.statusStaf === 'Terlambat' ? 'text-amber-600' : 'text-emerald-600'}>{log.statusStaf}</strong></span>
+                                        <span>{isBkLog ? 'Guru BK' : 'Staf'}: <strong className={log.statusStaf === 'Terlambat' ? 'text-amber-600' : 'text-emerald-600'}>{log.statusStaf}</strong></span>
                                       )}
                                       {log.statusStaf && log.statusMengajar && <span>•</span>}
                                       {log.statusMengajar && (
@@ -1111,6 +1117,7 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
                 <div className="md:hidden divide-y divide-slate-200">
                   {filteredLogs.map((log) => {
                     const isLegacy = (!log.statusStaf || log.statusStaf === '-') && (!log.statusMengajar || log.statusMengajar === '-');
+                    const isBkLog = (log.peran || '').toLowerCase().includes('bk') || isGuruBkJabatan(log.jabatan);
                     const activeStatus = viewMode === 'staf'
                       ? (log.statusStaf || log.status)
                       : viewMode === 'guru'
@@ -1158,7 +1165,7 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
                               <span className="text-slate-400 block text-[10px] uppercase font-bold">Rincian Evaluasi</span>
                               <div className="flex flex-wrap gap-2 mt-0.5">
                                 {log.statusStaf && (
-                                  <span>Staf: <strong className={log.statusStaf === 'Terlambat' ? 'text-amber-700' : 'text-emerald-700'}>{log.statusStaf}</strong></span>
+                                  <span>{isBkLog ? 'Guru BK' : 'Staf'}: <strong className={log.statusStaf === 'Terlambat' ? 'text-amber-700' : 'text-emerald-700'}>{log.statusStaf}</strong></span>
                                 )}
                                 {log.statusMengajar && (
                                   <span>Mengajar: <strong className={log.statusMengajar === 'Terlambat' ? 'text-amber-700' : 'text-emerald-700'}>{log.statusMengajar}</strong></span>
@@ -1209,7 +1216,7 @@ export const RekapRiwayat: React.FC<RekapRiwayatProps> = ({
             </div>
             <p className="text-xs text-slate-600 leading-relaxed">
               Merekapitulasi keterlambatan staf dan keterlambatan mengajar secara terpisah per individu.
-              Kolom <strong>Total Hari Bermasalah</strong> menghitung jumlah <em>tanggal unik</em> yang memiliki minimal 1 keterlambatan atau alpa (jika terlambat staf dan mengajar pada hari yang sama, tetap dihitung 1 hari).
+              Kolom <strong>Total Hari Bermasalah</strong> menghitung jumlah <em>tanggal unik</em> yang memiliki minimal 1 keterlambatan atau alpa (jika terlambat staf dan mengajar pada hari yang sama, tetap dihitung 1 hari). Status <strong>Cuti Resmi</strong> (memiliki izin cuti &amp; guru pengganti), <strong>Izin</strong>, <strong>Sakit</strong>, dan <strong>Dinas Luar</strong> <u>tidak</u> dihitung sebagai pelanggaran.
             </p>
           </div>
 
